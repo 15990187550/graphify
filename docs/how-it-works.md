@@ -27,7 +27,7 @@ Markdown sidecars under `graphify-out/converted/`. Office files (`.docx`,
 
 Communities are found using the [Leiden algorithm](https://www.nature.com/articles/s41598-019-41695-z) — a graph-clustering method that groups nodes by edge density. Nodes with many connections between them end up in the same community.
 
-**No embeddings needed.** The semantic similarity edges that Claude extracts (`semantically_similar_to`) are already in the graph, so they influence community shape directly. The graph structure is the similarity signal — there's no separate embedding step or vector database.
+**Clustering does not use embeddings.** The semantic similarity edges that Claude extracts (`semantically_similar_to`) are already in the graph, so they influence community shape directly. `graphify index` may build a local multilingual embedding index for query recall, but community detection remains graph-topology based.
 
 ---
 

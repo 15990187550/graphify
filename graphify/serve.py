@@ -23,9 +23,11 @@ def _load_graph(graph_path: str) -> nx.Graph:
             data = dict(data, links=data["edges"])
         data = {**data, "directed": True}
         try:
-            return json_graph.node_link_graph(data, edges="links")
+            G = json_graph.node_link_graph(data, edges="links")
         except TypeError:
-            return json_graph.node_link_graph(data)
+            G = json_graph.node_link_graph(data)
+        G.graph["_graph_path"] = str(resolved)
+        return G
     except (ValueError, FileNotFoundError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -126,6 +128,42 @@ def _pick_seeds(scored: list[tuple[float, str]], max_k: int = 3, gap_ratio: floa
     return seeds
 
 
+_EMBEDDING_CACHE: dict = {}
+
+
+def _hybrid_seed_scores(G: nx.Graph, question: str, terms: list[str], top_k: int = 5) -> list[tuple[float, str]]:
+    lexical = _score_nodes(G, terms)
+    if not lexical:
+        lexical_by_id: dict[str, float] = {}
+    else:
+        top = lexical[0][0] or 1.0
+        lexical_by_id = {nid: score / top for score, nid in lexical}
+
+    vector_by_id: dict[str, float] = {}
+    graph_path = G.graph.get("_graph_path")
+    if graph_path:
+        try:
+            from graphify.search_index import rank_indexed_nodes
+            for score, nid in rank_indexed_nodes(graph_path, question, top_k=top_k * 4, cache=_EMBEDDING_CACHE):
+                if nid in G:
+                    vector_by_id[nid] = max(vector_by_id.get(nid, 0.0), score)
+        except Exception:
+            vector_by_id = {}
+
+    all_ids = set(lexical_by_id) | set(vector_by_id)
+    combined: list[tuple[float, str]] = []
+    for nid in all_ids:
+        score = vector_by_id.get(nid, 0.0)
+        if nid in lexical_by_id:
+            # Lexical matches are exact evidence from graph labels/source paths.
+            # Keep them above pure embedding hits so semantic search improves
+            # recall without stealing precise code-symbol queries.
+            score += 10.0 + lexical_by_id[nid]
+        combined.append((score, nid))
+    combined.sort(reverse=True)
+    return combined[:top_k]
+
+
 _CONTEXT_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("call", ("call", "calls", "called", "invoke", "invokes", "invoked")),
     ("import", ("import", "imports", "imported", "module", "modules")),
@@ -188,7 +226,43 @@ def _filter_graph_by_context(G: nx.Graph, context_filters: list[str] | None) -> 
     return H
 
 
-def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], list[tuple]]:
+_MAX_QUERY_NODES = 120
+_MAX_NEIGHBORS_PER_NODE = 32
+_RELATION_PRIORITY = {
+    "calls": 0,
+    "method": 1,
+    "contains": 2,
+    "inherits": 3,
+    "conforms_to": 3,
+    "implements": 3,
+    "references": 4,
+    "imports": 5,
+    "imports_from": 5,
+    "paired_with": 6,
+    "semantically_similar_to": 8,
+}
+
+
+def _edge_priority(G: nx.Graph, u: str, v: str) -> tuple[int, int, str]:
+    raw = G[u][v]
+    data = next(iter(raw.values()), {}) if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)) else raw
+    relation = str(data.get("relation") or "")
+    label = str(G.nodes[v].get("label", v))
+    return (_RELATION_PRIORITY.get(relation, 7), G.degree(v), label)
+
+
+def _ordered_neighbors(G: nx.Graph, node: str, limit: int) -> list[str]:
+    return sorted(G.neighbors(node), key=lambda nb: _edge_priority(G, node, nb))[:limit]
+
+
+def _bfs(
+    G: nx.Graph,
+    start_nodes: list[str],
+    depth: int,
+    *,
+    max_nodes: int = _MAX_QUERY_NODES,
+    max_neighbors_per_node: int = _MAX_NEIGHBORS_PER_NODE,
+) -> tuple[set[str], list[tuple]]:
     # Compute hub threshold: nodes above this degree are not expanded as transit.
     # p99 of degree distribution, floored at 50 to avoid over-blocking small graphs.
     degrees = [G.degree(n) for n in G.nodes()]
@@ -205,12 +279,16 @@ def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
     for _ in range(depth):
         next_frontier: set[str] = set()
         for n in frontier:
+            if len(visited) + len(next_frontier) >= max_nodes:
+                break
             # Don't expand through high-degree hubs (except seeds - a hub that
             # is the starting node should still be explored).
             if n not in seed_set and G.degree(n) >= hub_threshold:
                 continue
-            for neighbor in G.neighbors(n):
-                if neighbor not in visited:
+            for neighbor in _ordered_neighbors(G, n, max_neighbors_per_node):
+                if len(visited) + len(next_frontier) >= max_nodes:
+                    break
+                if neighbor not in visited and neighbor not in next_frontier:
                     next_frontier.add(neighbor)
                     edges_seen.append((n, neighbor))
         visited.update(next_frontier)
@@ -218,7 +296,14 @@ def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
     return visited, edges_seen
 
 
-def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], list[tuple]]:
+def _dfs(
+    G: nx.Graph,
+    start_nodes: list[str],
+    depth: int,
+    *,
+    max_nodes: int = _MAX_QUERY_NODES,
+    max_neighbors_per_node: int = _MAX_NEIGHBORS_PER_NODE,
+) -> tuple[set[str], list[tuple]]:
     degrees = [G.degree(n) for n in G.nodes()]
     if degrees:
         degrees_sorted = sorted(degrees)
@@ -231,13 +316,15 @@ def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
     edges_seen: list[tuple] = []
     stack = [(n, 0) for n in reversed(start_nodes)]
     while stack:
+        if len(visited) >= max_nodes:
+            break
         node, d = stack.pop()
         if node in visited or d > depth:
             continue
         visited.add(node)
         if node not in seed_set and G.degree(node) >= hub_threshold:
             continue
-        for neighbor in G.neighbors(node):
+        for neighbor in reversed(_ordered_neighbors(G, node, max_neighbors_per_node)):
             if neighbor not in visited:
                 stack.append((neighbor, d + 1))
                 edges_seen.append((node, neighbor))
@@ -307,8 +394,7 @@ def _query_graph_text(
     context_filters: list[str] | None = None,
 ) -> str:
     terms = [t.lower() for t in question.split() if len(t) > 2]
-    scored = _score_nodes(G, terms)
-    start_nodes = _pick_seeds(scored)
+    start_nodes = _pick_seeds(_hybrid_seed_scores(G, question, terms, top_k=5), max_k=5)
     if not start_nodes:
         return "No matching nodes found."
     resolved_filters, filter_source = _resolve_context_filters(question, context_filters)
@@ -322,7 +408,7 @@ def _query_graph_text(
         header_parts.append(f"Context: {', '.join(resolved_filters)} ({filter_source})")
     header_parts.append(f"{len(nodes)} nodes found")
     header = " | ".join(header_parts) + "\n\n"
-    return header + _subgraph_to_text(traversal_graph, nodes, edges, token_budget)
+    return header + _subgraph_to_text(traversal_graph, nodes, edges, token_budget, seeds=start_nodes)
 
 
 def _find_node(G: nx.Graph, label: str) -> list[str]:

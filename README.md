@@ -205,6 +205,13 @@ To remove graphify from all platforms at once: `graphify uninstall` (add `--purg
 
 Code is extracted locally with no API calls (AST via tree-sitter). Everything else goes through your AI assistant's model API.
 
+`graphify index` builds a local multilingual vector/alias index beside
+`graph.json` so `graphify query` can match natural-language questions to code
+symbols. Project-specific vocabulary can be supplied in
+`graphify-out/graphify.aliases.json`; patterns match both `source_file` and
+symbol labels. graphify does not bake product-specific aliases into the default
+package.
+
 Google Drive for desktop `.gdoc`, `.gsheet`, and `.gslides` files are shortcut
 pointers, not document content. To include native Google Docs, Sheets, and Slides
 in a headless extraction, install and authenticate the

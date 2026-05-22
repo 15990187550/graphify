@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+
+def test_objc_runtime_extracts_notifications_and_header_pairs(tmp_path):
+    from graphify.objc_runtime import extract_objc_runtime
+
+    (tmp_path / "Poster.h").write_text("@interface Poster : NSObject\n@end\n", encoding="utf-8")
+    (tmp_path / "Poster.m").write_text(
+        """
+@implementation Poster
+- (void)send {
+    [[NSNotificationCenter defaultCenter] postNotificationName:MyNotice object:nil];
+}
+@end
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "Observer.m").write_text(
+        """
+@implementation Observer
+- (void)start {
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handle:) name:MyNotice object:nil];
+}
+@end
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_objc_runtime(tmp_path)
+
+    relations = {e["relation"] for e in result["edges"]}
+    assert "notifies" in relations
+    assert "paired_with" in relations
+    notify = next(e for e in result["edges"] if e["relation"] == "notifies")
+    assert notify["context"] == "notification"
+    assert notify["confidence"] == "INFERRED"
+
+
+def test_objc_runtime_extracts_property_handler_calls(tmp_path):
+    from graphify.objc_runtime import extract_objc_runtime
+
+    (tmp_path / "Helper.m").write_text("@implementation MyHandler\n@end\n", encoding="utf-8")
+    (tmp_path / "Owner.h").write_text(
+        "@interface Owner : NSObject\n@property (nonatomic, strong) MyHandler *messageHandler;\n@end\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Owner.m").write_text(
+        """
+@implementation Owner
+- (void)go {
+    [self.messageHandler run];
+}
+@end
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_objc_runtime(tmp_path)
+
+    assert any(
+        e["relation"] == "calls"
+        and e["context"] == "call"
+        and "messageHandler" in (e.get("source_location") or "")
+        for e in result["edges"]
+    )
+

@@ -17,7 +17,11 @@ def _write_graph(tmp_path):
     G.add_edge("n1", "n2", relation="calls", confidence="EXTRACTED", context="call")
     G.add_edge("n2", "n3", relation="imports", confidence="EXTRACTED", context="import")
     graph_path = tmp_path / "graph.json"
-    graph_path.write_text(json.dumps(json_graph.node_link_data(G, edges="links")))
+    try:
+        data = json_graph.node_link_data(G, edges="links")
+    except TypeError:
+        data = json_graph.node_link_data(G)
+    graph_path.write_text(json.dumps(data))
     return graph_path
 
 
@@ -49,3 +53,46 @@ def test_query_cli_heuristic_context_filter(monkeypatch, tmp_path, capsys):
     assert "Context: call (heuristic)" in out
     assert "cluster" in out
     assert "build" not in out
+
+
+def test_query_cli_depth_flag(monkeypatch, tmp_path, capsys):
+    graph_path = _write_graph(tmp_path)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        mainmod.sys,
+        "argv",
+        ["graphify", "query", "extract", "--depth", "1", "--graph", str(graph_path)],
+    )
+    mainmod.main()
+    out = capsys.readouterr().out
+    assert "Traversal: BFS depth=1" in out
+
+
+def test_index_cli_builds_vector_index(monkeypatch, tmp_path, capsys):
+    import numpy as np
+    import sys
+    import types
+
+    graph_path = _write_graph(tmp_path)
+    fake = types.ModuleType("fastembed")
+
+    class TextEmbedding:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def embed(self, texts, **_kwargs):
+            for _ in texts:
+                yield np.array([1.0, 0.0], dtype=np.float32)
+
+    fake.TextEmbedding = TextEmbedding
+    monkeypatch.setitem(sys.modules, "fastembed", fake)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        mainmod.sys,
+        "argv",
+        ["graphify", "index", "--graph", str(graph_path), "--model", "fake/model"],
+    )
+    mainmod.main()
+    out = capsys.readouterr().out
+    assert "Index written:" in out
+    assert (tmp_path / ".graphify_embeddings.npy").exists()

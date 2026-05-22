@@ -182,11 +182,30 @@ def test_query_graph_text_heuristic_context_filter_changes_traversal():
     assert "build" not in text
 
 
+def test_query_graph_text_caps_broad_depth_expansion():
+    G = nx.DiGraph()
+    G.add_node("seed", label="TranspondHandler", community=0)
+    for i in range(200):
+        mid = f"mid_{i}"
+        leaf = f"leaf_{i}"
+        G.add_node(mid, label=f"UnrelatedManager{i}", community=0)
+        G.add_node(leaf, label=f"UnrelatedLeaf{i}", community=0)
+        G.add_edge("seed", mid, relation="calls", confidence="EXTRACTED", context="call")
+        G.add_edge(mid, leaf, relation="calls", confidence="EXTRACTED", context="call")
+
+    text = _query_graph_text(G, "Transpond", mode="bfs", depth=3, token_budget=20000)
+
+    assert "65 nodes found" in text
+
+
 # --- _load_graph ---
 
 def test_load_graph_roundtrip(tmp_path):
     G = _make_graph()
-    data = json_graph.node_link_data(G, edges="links")
+    try:
+        data = json_graph.node_link_data(G, edges="links")
+    except TypeError:
+        data = json_graph.node_link_data(G)
     p = tmp_path / "graph.json"
     p.write_text(json.dumps(data))
     G2 = _load_graph(str(p))
@@ -207,7 +226,10 @@ def _write_graph(path, nodes: list[str]) -> None:
     G = nx.DiGraph()
     for n in nodes:
         G.add_node(n, label=n, community=0)
-    data = json_graph.node_link_data(G, edges="links")
+    try:
+        data = json_graph.node_link_data(G, edges="links")
+    except TypeError:
+        data = json_graph.node_link_data(G)
     path.write_text(json.dumps(data), encoding="utf-8")
 
 

@@ -651,6 +651,55 @@ def test_objc_no_dangling_edges():
         assert e["source"] in node_ids, f"Dangling source: {e}"
 
 
+def test_objc_interface_inheritance_resolves_same_file_target(tmp_path):
+    path = tmp_path / "Inheritance.m"
+    path.write_text(
+        """
+@interface Parent : NSObject
+@end
+
+@interface Child : Parent
+@end
+""",
+        encoding="utf-8",
+    )
+    r = extract_objc(path)
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    assert any(
+        node_by_id.get(e["source"]) == "Child"
+        and node_by_id.get(e["target"]) == "Parent"
+        for e in r["edges"]
+        if e["relation"] == "inherits"
+    )
+
+
+def test_objc_class_new_message_calls_class_node(tmp_path):
+    path = tmp_path / "FactoryUse.m"
+    path.write_text(
+        """
+@interface Factory : NSObject
+@end
+@implementation Factory
+@end
+
+@implementation Owner
+- (void)run {
+    Factory *factory = [Factory new];
+}
+@end
+""",
+        encoding="utf-8",
+    )
+    r = extract_objc(path)
+    node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    assert any(
+        "run" in node_by_id.get(e["source"], "")
+        and node_by_id.get(e["target"]) == "Factory"
+        for e in r["edges"]
+        if e["relation"] == "calls"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Go
 # ---------------------------------------------------------------------------

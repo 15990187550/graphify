@@ -24,6 +24,8 @@ Each stage is a single function in its own module. They communicate through plai
 | `callflow_html.py` | `write_callflow_html(...)` | graphify-out files → Mermaid architecture/call-flow HTML |
 | `ingest.py` | `ingest(url, ...)` | URL → file saved to corpus dir |
 | `cache.py` | `check_semantic_cache / save_semantic_cache` | files → (cached, uncached) split |
+| `search_index.py` | `build_index()` | graph.json → local vector/alias query index |
+| `objc_runtime.py` | `extract_objc_runtime()` | Objective-C root → inferred runtime relationship extraction |
 | `security.py` | validation helpers | URL / path / label → validated or raises |
 | `validate.py` | `validate_extraction(data)` | extraction dict → raises on schema errors |
 | `serve.py` | `start_server(graph_path)` | graph file path → MCP stdio server |

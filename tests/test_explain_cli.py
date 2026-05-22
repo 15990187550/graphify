@@ -54,3 +54,28 @@ def test_caller_shows_callee_as_outbound(monkeypatch, tmp_path, capsys):
     out = _run(monkeypatch, p, "createPatchHandler", capsys)
     assert "--> validateSanitySession() [calls]" in out
     assert "<-- " not in out
+
+
+def test_class_explain_shows_direct_method_call_chain(monkeypatch, tmp_path, capsys):
+    graph_data = {
+        "directed": True,
+        "multigraph": False,
+        "graph": {},
+        "nodes": [
+            {"id": "handler", "label": "PopoSessionTranspondMessageHandler", "source_file": "handler.mm", "community": 0},
+            {"id": "transpond", "label": "-handlerTranspondMessage", "source_file": "handler.mm", "community": 0},
+            {"id": "send_leave", "label": "-beginSendLeaveMessage", "source_file": "handler.mm", "community": 0},
+        ],
+        "links": [
+            {"source": "handler", "target": "transpond", "relation": "method", "confidence": "EXTRACTED"},
+            {"source": "handler", "target": "send_leave", "relation": "method", "confidence": "EXTRACTED"},
+            {"source": "transpond", "target": "send_leave", "relation": "calls", "confidence": "EXTRACTED", "source_location": "L42"},
+        ],
+    }
+    p = tmp_path / "graph.json"
+    p.write_text(json.dumps(graph_data))
+
+    out = _run(monkeypatch, p, "PopoSessionTranspondMessageHandler", capsys)
+
+    assert "Direct method calls:" in out
+    assert "-handlerTranspondMessage -> -beginSendLeaveMessage [calls] L42" in out

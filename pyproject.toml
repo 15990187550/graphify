@@ -12,6 +12,8 @@ keywords = ["claude", "claude-code", "codex", "opencode", "cursor", "gemini", "a
 requires-python = ">=3.10"
 dependencies = [
     "networkx",
+    "numpy",
+    "fastembed",
     "datasketch",
     "rapidfuzz",
     "tree-sitter>=0.23.0",

@@ -1236,8 +1236,11 @@ def main() -> None:
         print("  cluster-only <path>     rerun clustering on an existing graph.json and regenerate report")
         print("    --no-viz                skip graph.html generation (useful for >5000 node graphs / CI)")
         print("    --graph <path>          path to graph.json (default <path>/graphify-out/graph.json)")
+        print("  index [--graph path]    build vector search index for graph.json")
+        print("    --model M               embedding model (default multilingual MiniLM)")
         print("  query \"<question>\"       BFS traversal of graph.json for a question")
         print("    --dfs                   use depth-first instead of breadth-first")
+        print("    --depth N               traversal depth (default: 2)")
         print("    --context C             explicit edge-context filter (repeatable)")
         print("    --budget N              cap output at N tokens (default 2000)")
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
@@ -1488,9 +1491,41 @@ def main() -> None:
         else:
             print("Usage: graphify hook [install|uninstall|status]", file=sys.stderr)
             sys.exit(1)
+    elif cmd == "index":
+        from graphify.search_index import build_index
+        graph_path = _default_graph_path()
+        model_name: str | None = None
+        args = sys.argv[2:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif args[i].startswith("--graph="):
+                graph_path = args[i].split("=", 1)[1]; i += 1
+            elif args[i] == "--model" and i + 1 < len(args):
+                model_name = args[i + 1]; i += 2
+            elif args[i].startswith("--model="):
+                model_name = args[i].split("=", 1)[1]; i += 1
+            elif args[i] == "--force":
+                i += 1
+            else:
+                i += 1
+        gp = Path(graph_path).resolve()
+        if not gp.exists():
+            print(f"error: graph file not found: {gp}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            result = build_index(gp, model_name=model_name)
+        except ImportError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(
+            f"Index written: {result.node_count} nodes, "
+            f"{result.embedding_dim} dims, {result.alias_count} aliases -> {result.out_dir}"
+        )
     elif cmd == "query":
         if len(sys.argv) < 3:
-            print("Usage: graphify query \"<question>\" [--dfs] [--context C] [--budget N] [--graph path]", file=sys.stderr)
+            print("Usage: graphify query \"<question>\" [--dfs] [--depth N] [--context C] [--budget N] [--graph path]", file=sys.stderr)
             sys.exit(1)
         from graphify.serve import _query_graph_text
         from graphify.security import sanitize_label
@@ -1498,6 +1533,7 @@ def main() -> None:
         question = sys.argv[2]
         use_dfs = "--dfs" in sys.argv
         budget = 2000
+        depth = 2
         graph_path = _default_graph_path()
         context_filters: list[str] = []
         args = sys.argv[3:]
@@ -1525,6 +1561,20 @@ def main() -> None:
                 i += 1
             elif args[i] == "--graph" and i + 1 < len(args):
                 graph_path = args[i + 1]; i += 2
+            elif args[i] == "--depth" and i + 1 < len(args):
+                try:
+                    depth = int(args[i + 1])
+                except ValueError:
+                    print(f"error: --depth must be an integer", file=sys.stderr)
+                    sys.exit(1)
+                i += 2
+            elif args[i].startswith("--depth="):
+                try:
+                    depth = int(args[i].split("=", 1)[1])
+                except ValueError:
+                    print(f"error: --depth must be an integer", file=sys.stderr)
+                    sys.exit(1)
+                i += 1
             else:
                 i += 1
         gp = Path(graph_path).resolve()
@@ -1544,6 +1594,7 @@ def main() -> None:
                 G = json_graph.node_link_graph(_raw, edges="links")
             except TypeError:
                 G = json_graph.node_link_graph(_raw)
+            G.graph["_graph_path"] = str(gp)
         except Exception as exc:
             print(f"error: could not load graph: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -1552,7 +1603,7 @@ def main() -> None:
                 G,
                 question,
                 mode="dfs" if use_dfs else "bfs",
-                depth=2,
+                depth=depth,
                 token_budget=budget,
                 context_filters=context_filters,
             )
@@ -1712,6 +1763,34 @@ def main() -> None:
                 print(f"  {arrow} {G.nodes[nb].get('label', nb)} [{rel}] [{conf}]")
             if len(connections) > 20:
                 print(f"  ... and {len(connections) - 20} more")
+        method_ids = [
+            nb for nb in G.successors(nid)
+            if edge_data(G, nid, nb).get("relation") == "method"
+        ]
+        method_set = set(method_ids)
+        direct_calls: list[tuple[int, str, str, dict]] = []
+        for src in method_ids:
+            for tgt in G.successors(src):
+                if tgt not in method_set:
+                    continue
+                edata = edge_data(G, src, tgt)
+                if edata.get("relation") != "calls":
+                    continue
+                loc = str(edata.get("source_location") or "")
+                line_match = re.search(r"\d+", loc)
+                line_no = int(line_match.group(0)) if line_match else 10**9
+                direct_calls.append((line_no, src, tgt, edata))
+        if direct_calls:
+            print("\nDirect method calls:")
+            for _line, src, tgt, edata in sorted(direct_calls)[:20]:
+                loc = edata.get("source_location") or ""
+                loc_suffix = f" {loc}" if loc else ""
+                print(
+                    f"  {G.nodes[src].get('label', src)} -> "
+                    f"{G.nodes[tgt].get('label', tgt)} [calls]{loc_suffix}"
+                )
+            if len(direct_calls) > 20:
+                print(f"  ... and {len(direct_calls) - 20} more")
 
     elif cmd == "add":
         if len(sys.argv) < 3:
@@ -2406,7 +2485,7 @@ def main() -> None:
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
                 "[--model M] [--out DIR] [--google-workspace] [--no-cluster] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
-                "[--api-timeout S]",
+                "[--api-timeout S] [--no-vector-index] [--no-objc-runtime]",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -2433,6 +2512,8 @@ def main() -> None:
         cli_resolution: float = 1.0
         cli_exclude_hubs: float | None = None
         cli_excludes: list[str] = []
+        no_vector_index = False
+        no_objc_runtime = False
 
         def _parse_int(name: str, raw: str) -> int:
             try:
@@ -2510,6 +2591,10 @@ def main() -> None:
                 cli_excludes.append(args[i + 1]); i += 2
             elif a.startswith("--exclude="):
                 cli_excludes.append(a.split("=", 1)[1]); i += 1
+            elif a == "--no-vector-index":
+                no_vector_index = True; i += 1
+            elif a == "--no-objc-runtime":
+                no_objc_runtime = True; i += 1
             else:
                 i += 1
 
@@ -2668,6 +2753,26 @@ def main() -> None:
                 print(f"[graphify extract] AST extraction failed: {exc}", file=sys.stderr)
                 ast_result = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
 
+        runtime_result: dict = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+        has_objc = any(p.suffix.lower() in {".m", ".mm", ".h"} for p in code_files)
+        if has_objc and not no_objc_runtime and not os.environ.get("GRAPHIFY_NO_OBJC_RUNTIME"):
+            try:
+                from graphify.objc_runtime import extract_objc_runtime
+                print("[graphify extract] Objective-C runtime edge extraction...")
+                runtime_result = extract_objc_runtime(target, extra_excludes=cli_excludes or None)
+                if runtime_result.get("edges"):
+                    (graphify_out / ".graphify_runtime_edges.json").write_text(
+                        json.dumps(runtime_result, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    print(
+                        f"[graphify extract] Objective-C runtime: "
+                        f"{len(runtime_result.get('nodes', []))} nodes, "
+                        f"{len(runtime_result.get('edges', []))} edges"
+                    )
+            except Exception as exc:
+                print(f"[graphify extract] warning: Objective-C runtime extraction failed: {exc}", file=sys.stderr)
+
         # Semantic extraction on docs/papers/images. Check cache first.
         from graphify.cache import (
             check_semantic_cache as _check_semantic_cache,
@@ -2749,9 +2854,17 @@ def main() -> None:
         # for symbols also referenced in docs). Hyperedges only come from the
         # semantic side.
         merged: dict = {
-            "nodes": list(ast_result.get("nodes", [])) + list(sem_result.get("nodes", [])),
-            "edges": list(ast_result.get("edges", [])) + list(sem_result.get("edges", [])),
-            "hyperedges": list(sem_result.get("hyperedges", [])),
+            "nodes": (
+                list(ast_result.get("nodes", []))
+                + list(runtime_result.get("nodes", []))
+                + list(sem_result.get("nodes", []))
+            ),
+            "edges": (
+                list(ast_result.get("edges", []))
+                + list(runtime_result.get("edges", []))
+                + list(sem_result.get("edges", []))
+            ),
+            "hyperedges": list(runtime_result.get("hyperedges", [])) + list(sem_result.get("hyperedges", [])),
             "input_tokens": ast_result.get("input_tokens", 0) + sem_result.get("input_tokens", 0),
             "output_tokens": ast_result.get("output_tokens", 0) + sem_result.get("output_tokens", 0),
         }
@@ -2798,6 +2911,15 @@ def main() -> None:
                     f"{merged['output_tokens']:,} out, "
                     f"est. cost: ${cost:.4f}"
                 )
+            if not no_vector_index and not os.environ.get("GRAPHIFY_NO_VECTOR_INDEX"):
+                try:
+                    from graphify.search_index import build_index as _build_search_index
+                    idx = _build_search_index(graph_json_path)
+                    print(f"[graphify extract] vector index: {idx.node_count} nodes, {idx.embedding_dim} dims")
+                except ImportError as exc:
+                    print(f"[graphify extract] warning: vector index skipped ({exc})", file=sys.stderr)
+                except Exception as exc:
+                    print(f"[graphify extract] warning: vector index failed: {exc}", file=sys.stderr)
             try:
                 _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both")
             except Exception as exc:
@@ -2915,6 +3037,15 @@ def main() -> None:
                 f"{merged['output_tokens']:,} out, "
                 f"est. cost (~{backend}): ${cost:.4f}"
             )
+        if not no_vector_index and not os.environ.get("GRAPHIFY_NO_VECTOR_INDEX"):
+            try:
+                from graphify.search_index import build_index as _build_search_index
+                idx = _build_search_index(graph_json_path)
+                print(f"[graphify extract] vector index: {idx.node_count} nodes, {idx.embedding_dim} dims")
+            except ImportError as exc:
+                print(f"[graphify extract] warning: vector index skipped ({exc})", file=sys.stderr)
+            except Exception as exc:
+                print(f"[graphify extract] warning: vector index failed: {exc}", file=sys.stderr)
 
     elif cmd == "cache-check":
         # graphify cache-check <files_from> [--root <dir>]

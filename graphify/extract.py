@@ -4461,7 +4461,10 @@ def extract_objc(path: Path) -> dict:
     nodes: list[dict] = []
     edges: list[dict] = []
     seen_ids: set[str] = set()
+    seen_edges: set[tuple[str, str, str, str | None]] = set()
     method_bodies: list[tuple[str, Any]] = []
+    class_name_to_nid: dict[str, str] = {}
+    pending_inherits: list[tuple[str, str, int]] = []
 
     def add_node(nid: str, label: str, line: int) -> None:
         if nid not in seen_ids:
@@ -4472,6 +4475,10 @@ def extract_objc(path: Path) -> dict:
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0,
                  context: str | None = None) -> None:
+        key = (src, tgt, relation, context)
+        if key in seen_edges:
+            return
+        seen_edges.add(key)
         edge = {"source": src, "target": tgt, "relation": relation,
                 "confidence": confidence, "source_file": str_path,
                 "source_location": f"L{line}", "weight": weight}
@@ -4523,6 +4530,7 @@ def extract_objc(path: Path) -> dict:
                 return
             name = _read(identifiers[0])
             cls_nid = _make_id(stem, name)
+            class_name_to_nid[name] = cls_nid
             add_node(cls_nid, name, line)
             add_edge(file_nid, cls_nid, "contains", line)
             # superclass is second identifier after ':'
@@ -4531,8 +4539,7 @@ def extract_objc(path: Path) -> dict:
                 if child.type == ":":
                     colon_seen = True
                 elif colon_seen and child.type == "identifier":
-                    super_nid = _make_id(_read(child))
-                    add_edge(cls_nid, super_nid, "inherits", line)
+                    pending_inherits.append((cls_nid, _read(child), line))
                     colon_seen = False
                 elif child.type == "parameterized_arguments":
                     # protocols adopted
@@ -4558,6 +4565,7 @@ def extract_objc(path: Path) -> dict:
                     walk(child, parent_nid)
                 return
             impl_nid = _make_id(stem, name)
+            class_name_to_nid[name] = impl_nid
             if impl_nid not in seen_ids:
                 add_node(impl_nid, name, line)
                 add_edge(file_nid, impl_nid, "contains", line)
@@ -4608,6 +4616,24 @@ def extract_objc(path: Path) -> dict:
 
     walk(root)
 
+    # Text fallback for Objective-C inheritance. tree-sitter-objc versions vary
+    # in how they expose the superclass token, and some project files with
+    # macros around @interface can hide the `: ParentClass` child shape.
+    text_source = source.decode("utf-8", errors="replace")
+    for match in re.finditer(r"@interface\s+([A-Za-z_]\w*)\s*:\s*([A-Za-z_]\w*)", text_source):
+        child_name, super_name = match.groups()
+        line = text_source.count("\n", 0, match.start()) + 1
+        child_nid = class_name_to_nid.get(child_name) or _make_id(stem, child_name)
+        class_name_to_nid.setdefault(child_name, child_nid)
+        add_node(child_nid, child_name, line)
+        pending_inherits.append((child_nid, super_name, line))
+
+    for cls_nid, super_name, line in pending_inherits:
+        super_nid = class_name_to_nid.get(super_name) or _make_id(stem, super_name)
+        if super_nid not in seen_ids:
+            add_node(super_nid, super_name, line)
+        add_edge(cls_nid, super_nid, "inherits", line)
+
     # Second pass: resolve calls inside method bodies
     all_method_nids = {n["id"] for n in nodes if n["id"] != file_nid}
     seen_calls: set[tuple[str, str]] = set()
@@ -4637,6 +4663,19 @@ def extract_objc(path: Path) -> dict:
             for child in n.children:
                 walk_calls(child)
         walk_calls(body_node)
+
+        body_text = _read(body_node)
+        for match in re.finditer(r"\[\s*([A-Z][A-Za-z_0-9]*)\s+(new|alloc|allocWithZone|shared\w*|default\w*)\b", body_text):
+            class_name = match.group(1)
+            class_nid = class_name_to_nid.get(class_name)
+            if not class_nid or class_nid == caller_nid:
+                continue
+            line = body_node.start_point[0] + body_text.count("\n", 0, match.start()) + 1
+            pair = (caller_nid, class_nid)
+            if pair not in seen_calls:
+                seen_calls.add(pair)
+                add_edge(caller_nid, class_nid, "calls", line,
+                         confidence="EXTRACTED", weight=1.0, context="call")
 
     return {"nodes": nodes, "edges": edges, "input_tokens": 0, "output_tokens": 0}
 
