@@ -149,3 +149,202 @@ def test_chinese_alias_beats_vague_embedding_match(tmp_path, monkeypatch):
     ranked = rank_indexed_nodes(graph_path, "消息转发入口", top_k=2)
 
     assert ranked[0][1] == "transpond"
+
+
+def test_build_index_reuses_unchanged_node_embeddings(tmp_path, monkeypatch):
+    from graphify.search_index import build_index
+
+    graph_path = tmp_path / "graph.json"
+    _write_graph(
+        graph_path,
+        [
+            {"id": "alpha", "label": "AlphaManager", "source_file": "alpha.py"},
+            {"id": "beta", "label": "BetaManager", "source_file": "beta.py"},
+        ],
+    )
+    calls: list[list[str]] = []
+
+    def install_counting_fastembed():
+        fake = types.ModuleType("fastembed")
+
+        class TextEmbedding:
+            def __init__(self, model_name: str):
+                self.model_name = model_name
+
+            def embed(self, texts, **_kwargs):
+                batch = list(texts)
+                calls.append(batch)
+                for text in batch:
+                    if "AlphaManager" in text:
+                        yield np.array([1.0, 0.0], dtype=np.float32)
+                    elif "BetaManagerV2" in text:
+                        yield np.array([0.0, 0.5], dtype=np.float32)
+                    else:
+                        yield np.array([0.0, 1.0], dtype=np.float32)
+
+        fake.TextEmbedding = TextEmbedding
+        monkeypatch.setitem(sys.modules, "fastembed", fake)
+
+    install_counting_fastembed()
+    first = build_index(graph_path, model_name="fake/model")
+    assert first.reused_count == 0
+    assert first.embedded_count == 2
+
+    _write_graph(
+        graph_path,
+        [
+            {"id": "alpha", "label": "AlphaManager", "source_file": "alpha.py"},
+            {"id": "beta", "label": "BetaManagerV2", "source_file": "beta.py"},
+        ],
+    )
+    second = build_index(graph_path, model_name="fake/model")
+
+    assert second.reused_count == 1
+    assert second.embedded_count == 1
+    assert calls[-1] and len(calls[-1]) == 1
+    assert "BetaManagerV2" in calls[-1][0]
+    ids = json.loads((tmp_path / ".graphify_embed_ids.json").read_text(encoding="utf-8"))
+    embeddings = np.load(tmp_path / ".graphify_embeddings.npy")
+    assert ids == ["alpha", "beta"]
+    np.testing.assert_allclose(embeddings[0], np.array([1.0, 0.0], dtype=np.float32))
+    np.testing.assert_allclose(embeddings[1], np.array([0.0, 1.0], dtype=np.float32))
+
+
+def test_build_index_drops_deleted_nodes_incrementally(tmp_path, monkeypatch):
+    from graphify.search_index import build_index
+
+    graph_path = tmp_path / "graph.json"
+    _write_graph(
+        graph_path,
+        [
+            {"id": "alpha", "label": "AlphaManager", "source_file": "alpha.py"},
+            {"id": "beta", "label": "BetaManager", "source_file": "beta.py"},
+        ],
+    )
+    _install_fake_fastembed(monkeypatch, [[1.0, 0.0], [0.0, 1.0]])
+    build_index(graph_path, model_name="fake/model")
+
+    _write_graph(
+        graph_path,
+        [
+            {"id": "alpha", "label": "AlphaManager", "source_file": "alpha.py"},
+        ],
+    )
+    result = build_index(graph_path, model_name="fake/model")
+
+    assert result.reused_count == 1
+    assert result.embedded_count == 0
+    ids = json.loads((tmp_path / ".graphify_embed_ids.json").read_text(encoding="utf-8"))
+    embeddings = np.load(tmp_path / ".graphify_embeddings.npy")
+    assert ids == ["alpha"]
+    assert embeddings.shape == (1, 2)
+
+
+def test_alias_rule_change_reembeds_affected_nodes(tmp_path, monkeypatch):
+    from graphify.search_index import build_index
+
+    graph_path = tmp_path / "graph.json"
+    _write_graph(
+        graph_path,
+        [
+            {"id": "transpond", "label": "TranspondHandler", "source_file": "Session/Transpond/Foo.mm"},
+        ],
+    )
+    calls: list[list[str]] = []
+    fake = types.ModuleType("fastembed")
+
+    class TextEmbedding:
+        def __init__(self, model_name: str):
+            self.model_name = model_name
+
+        def embed(self, texts, **_kwargs):
+            batch = list(texts)
+            calls.append(batch)
+            for text in batch:
+                if "转发" in text:
+                    yield np.array([0.0, 1.0], dtype=np.float32)
+                else:
+                    yield np.array([1.0, 0.0], dtype=np.float32)
+
+    fake.TextEmbedding = TextEmbedding
+    monkeypatch.setitem(sys.modules, "fastembed", fake)
+
+    first = build_index(graph_path, model_name="fake/model")
+    assert first.embedded_count == 1
+
+    (tmp_path / "graphify.aliases.json").write_text(
+        json.dumps({"Transpond": ["转发"]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    second = build_index(graph_path, model_name="fake/model")
+
+    assert second.reused_count == 0
+    assert second.embedded_count == 1
+    assert "转发" in calls[-1][0]
+    aliases = json.loads((tmp_path / ".graphify_alias_index.json").read_text(encoding="utf-8"))
+    assert aliases["转发"] == ["transpond"]
+
+
+def test_model_change_forces_full_reembed(tmp_path, monkeypatch):
+    from graphify.search_index import build_index
+
+    graph_path = tmp_path / "graph.json"
+    _write_graph(
+        graph_path,
+        [
+            {"id": "alpha", "label": "AlphaManager", "source_file": "alpha.py"},
+            {"id": "beta", "label": "BetaManager", "source_file": "beta.py"},
+        ],
+    )
+    _install_fake_fastembed(monkeypatch, [[1.0, 0.0], [0.0, 1.0]])
+    build_index(graph_path, model_name="fake/model")
+
+    result = build_index(graph_path, model_name="fake/model-v2")
+
+    assert result.reused_count == 0
+    assert result.embedded_count == 2
+
+
+def test_load_index_rejects_stale_graph_stat(tmp_path, monkeypatch):
+    from graphify.search_index import build_index, load_index
+
+    graph_path = tmp_path / "graph.json"
+    _write_graph(
+        graph_path,
+        [
+            {"id": "alpha", "label": "AlphaManager", "source_file": "alpha.py"},
+        ],
+    )
+    _install_fake_fastembed(monkeypatch, [[1.0, 0.0]])
+    build_index(graph_path, model_name="fake/model")
+
+    _write_graph(
+        graph_path,
+        [
+            {"id": "alpha", "label": "AlphaManager", "source_file": "alpha.py"},
+            {"id": "beta", "label": "BetaManager", "source_file": "beta.py"},
+        ],
+    )
+
+    assert load_index(graph_path) is None
+
+
+def test_load_index_rejects_stale_alias_rules(tmp_path, monkeypatch):
+    from graphify.search_index import build_index, load_index
+
+    graph_path = tmp_path / "graph.json"
+    _write_graph(
+        graph_path,
+        [
+            {"id": "transpond", "label": "TranspondHandler", "source_file": "Session/Transpond/Foo.mm"},
+        ],
+    )
+    _install_fake_fastembed(monkeypatch, [[1.0, 0.0]])
+    build_index(graph_path, model_name="fake/model")
+
+    (tmp_path / "graphify.aliases.json").write_text(
+        json.dumps({"Transpond": ["转发"]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    assert load_index(graph_path) is None

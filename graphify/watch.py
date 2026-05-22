@@ -278,6 +278,8 @@ def _rebuild_code(
     follow_symlinks: bool = False,
     force: bool = False,
     no_cluster: bool = False,
+    no_vector_index: bool = False,
+    no_objc_runtime: bool = False,
     acquire_lock: bool = True,
     block_on_lock: bool = False,
 ) -> bool:
@@ -302,6 +304,11 @@ def _rebuild_code(
     ``no_cluster`` skips community detection and writes raw merged extraction
     JSON to graphify-out/graph.json (mirrors ``extract --no-cluster``).
 
+    ``no_vector_index`` skips the automatic incremental vector index refresh
+    after graph.json changes.
+
+    ``no_objc_runtime`` skips Objective-C convention/runtime edge inference.
+
     Returns True on success, False on error or skipped-due-to-lock.
     """
     out = watch_path / _GRAPHIFY_OUT
@@ -317,6 +324,8 @@ def _rebuild_code(
                 follow_symlinks=follow_symlinks,
                 force=force,
                 no_cluster=no_cluster,
+                no_vector_index=no_vector_index,
+                no_objc_runtime=no_objc_runtime,
                 acquire_lock=False,
             )
 
@@ -376,6 +385,26 @@ def _rebuild_code(
             "nodes": [], "edges": [], "hyperedges": [],
             "input_tokens": 0, "output_tokens": 0,
         }
+        has_objc = any(p.suffix.lower() in {".m", ".mm", ".h"} for p in code_files)
+        if has_objc and not no_objc_runtime and not os.environ.get("GRAPHIFY_NO_OBJC_RUNTIME"):
+            try:
+                from graphify.objc_runtime import extract_objc_runtime
+                runtime_result = extract_objc_runtime(watch_root)
+                if runtime_result.get("edges"):
+                    result = {
+                        "nodes": list(runtime_result.get("nodes", [])) + list(result.get("nodes", [])),
+                        "edges": list(result.get("edges", [])) + list(runtime_result.get("edges", [])),
+                        "hyperedges": list(runtime_result.get("hyperedges", [])) + list(result.get("hyperedges", [])),
+                        "input_tokens": result.get("input_tokens", 0),
+                        "output_tokens": result.get("output_tokens", 0),
+                    }
+                    print(
+                        f"[graphify watch] Objective-C runtime: "
+                        f"{len(runtime_result.get('nodes', []))} nodes, "
+                        f"{len(runtime_result.get('edges', []))} edges"
+                    )
+            except Exception as exc:
+                print(f"[graphify watch] warning: Objective-C runtime extraction failed: {exc}")
 
         # Preserve semantic nodes/edges from a previous full run.
         # AST-only rebuild replaces nodes for changed files; everything else is kept.
@@ -423,6 +452,22 @@ def _rebuild_code(
         out.mkdir(exist_ok=True)
         (out / ".graphify_root").write_text(str(watch_root), encoding="utf-8")
 
+        def _refresh_vector_index(graph_path: Path) -> None:
+            if no_vector_index or os.environ.get("GRAPHIFY_NO_VECTOR_INDEX"):
+                return
+            try:
+                from graphify.search_index import build_index
+                idx = build_index(graph_path)
+                print(
+                    f"[graphify watch] vector index: {idx.node_count} nodes, "
+                    f"{idx.embedding_dim} dims, reused {idx.reused_count}, "
+                    f"embedded {idx.embedded_count}"
+                )
+            except ImportError as exc:
+                print(f"[graphify watch] warning: vector index skipped ({exc})")
+            except Exception as exc:
+                print(f"[graphify watch] warning: vector index failed: {exc}")
+
         if no_cluster:
             # Normalise to "links" key so schema is consistent with the full clustered path.
             candidate_graph_data = {
@@ -464,6 +509,7 @@ def _rebuild_code(
                     f"{len(result.get('nodes', []))} nodes, {len(result.get('edges', []))} edges"
                 )
                 print(f"[graphify watch] graph.json updated in {out}")
+                _refresh_vector_index(existing_graph)
             return True
 
         detection = {
@@ -548,6 +594,7 @@ def _rebuild_code(
             graph_tmp.replace(existing_graph)
             report_path.write_text(report, encoding="utf-8")
             labels_file.write_text(labels_json, encoding="utf-8")
+            _refresh_vector_index(existing_graph)
 
         try:
             from graphify.detect import save_manifest

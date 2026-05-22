@@ -95,4 +95,44 @@ def test_index_cli_builds_vector_index(monkeypatch, tmp_path, capsys):
     mainmod.main()
     out = capsys.readouterr().out
     assert "Index written:" in out
+    assert "embedded 3" in out
     assert (tmp_path / ".graphify_embeddings.npy").exists()
+
+
+def test_index_cli_force_rebuilds_vector_index(monkeypatch, tmp_path, capsys):
+    import numpy as np
+    import sys
+    import types
+
+    graph_path = _write_graph(tmp_path)
+    fake = types.ModuleType("fastembed")
+
+    class TextEmbedding:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def embed(self, texts, **_kwargs):
+            for _ in texts:
+                yield np.array([1.0, 0.0], dtype=np.float32)
+
+    fake.TextEmbedding = TextEmbedding
+    monkeypatch.setitem(sys.modules, "fastembed", fake)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        mainmod.sys,
+        "argv",
+        ["graphify", "index", "--graph", str(graph_path), "--model", "fake/model"],
+    )
+    mainmod.main()
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        mainmod.sys,
+        "argv",
+        ["graphify", "index", "--graph", str(graph_path), "--model", "fake/model", "--force"],
+    )
+    mainmod.main()
+    out = capsys.readouterr().out
+
+    assert "reused 0" in out
+    assert "embedded 3" in out

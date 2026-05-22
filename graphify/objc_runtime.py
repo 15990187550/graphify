@@ -85,6 +85,7 @@ def extract_objc_runtime(root: str | Path, *, extra_excludes: list[str] | None =
     protocol_cons: dict[str, list[tuple[str, str]]] = defaultdict(list)
     category_classes: dict[str, list[tuple[str, str]]] = defaultdict(list)
     factory_regs: dict[str, list[str]] = defaultdict(list)
+    registered_classes: dict[str, list[str]] = defaultdict(list)
     protocol_methods: dict[str, set[str]] = defaultdict(set)
     impl_methods_by_class: dict[tuple[str, str], set[str]] = defaultdict(set)
     file_primary_symbol: dict[str, str] = {}
@@ -160,6 +161,18 @@ def extract_objc_runtime(root: str | Path, *, extra_excludes: list[str] | None =
                 factory_regs[reg.group(1)].append(rel_path)
             for reg in re.finditer(r"\[\[?(\w+)\s+(?:shared\w*|default\w*|sharedInstance|standard\w*|getInstance)\]*\]?\s+(\w*[Rr]egist\w*)", body):
                 factory_regs[reg.group(1)].append(rel_path)
+            for stmt in re.finditer(r"\[[^;\n]*(?:regist|register)\w*:[^;]*;", body):
+                statement = stmt.group(0)
+                for class_arg in re.finditer(r"\[\s*(\w+|self)\s+class\s*\]", statement):
+                    class_name = class_arg.group(1)
+                    if class_name == "self":
+                        class_name = file_class_name.get(rel_path) or file_primary_symbol.get(rel_path) or ""
+                    if class_name and not _class_or_protocol_is_system(class_name):
+                        registered_classes[rel_path].append(class_name)
+                for string_arg in re.finditer(r"NSClassFromString\s*\(\s*@\"(\w+)\"\s*\)", statement):
+                    class_name = string_arg.group(1)
+                    if class_name and not _class_or_protocol_is_system(class_name):
+                        registered_classes[rel_path].append(class_name)
 
         for match in re.finditer(r"Set(\w+Callback)\s*\(", content):
             callback_sets[match.group(1)].append(rel_path)
@@ -302,6 +315,12 @@ def extract_objc_runtime(root: str | Path, *, extra_excludes: list[str] | None =
         if target:
             for registrant in registrants:
                 add_edge(registrant, target, "registers_in", 0.75, f"+load -> [{registry} register]", "registration")
+
+    for registrant, class_names in registered_classes.items():
+        for class_name in class_names:
+            target = class_to_file.get(class_name)
+            if target:
+                add_edge(registrant, target, "calls", 0.8, f"+load registered class: {class_name}", "registration")
 
     explicit = {(e["source"], e["target"]) for e in edges if e["relation"] == "conforms_to"}
     for proto, required in protocol_methods.items():

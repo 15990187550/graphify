@@ -139,3 +139,33 @@ def test_objc_runtime_does_not_infer_small_protocol_from_method_overlap(tmp_path
         and str(e.get("source_location") or "").startswith("implicit:")
         for e in result["edges"]
     )
+
+
+def test_objc_runtime_extracts_registered_class_arguments(tmp_path):
+    from graphify.objc_runtime import extract_objc_runtime
+
+    (tmp_path / "MessageRouter.m").write_text(
+        """
+@implementation MessageRouter
++ (void)load {
+    [MessageRegistry registerHandlerClass:[ForwardHandler class] forType:1];
+}
+@end
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "ForwardHandler.m").write_text(
+        "@implementation ForwardHandler\n@end\n",
+        encoding="utf-8",
+    )
+
+    result = extract_objc_runtime(tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    edge = next(
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "registered class: ForwardHandler" in (e.get("source_location") or "")
+    )
+
+    assert nodes[edge["source"]]["label"] == "MessageRouter"
+    assert nodes[edge["target"]]["label"] == "ForwardHandler"

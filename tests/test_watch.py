@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+import types
 from pathlib import Path
 import pytest
 
@@ -173,13 +174,13 @@ def test_rebuild_code_is_idempotent_when_cluster_ids_flap(tmp_path, monkeypatch)
     monkeypatch.setattr(cluster_mod, "cluster", flaky_cluster)
     monkeypatch.setattr(cluster_mod, "score_all", lambda _G, comm: {cid: 1.0 for cid in comm})
 
-    assert _rebuild_code(tmp_path)
+    assert _rebuild_code(tmp_path, no_vector_index=True)
     graph_path = tmp_path / "graphify-out" / "graph.json"
     report_path = tmp_path / "graphify-out" / "GRAPH_REPORT.md"
     first_graph = graph_path.read_text(encoding="utf-8")
     first_report = report_path.read_text(encoding="utf-8")
 
-    assert _rebuild_code(tmp_path)
+    assert _rebuild_code(tmp_path, no_vector_index=True)
     second_graph = graph_path.read_text(encoding="utf-8")
     second_report = report_path.read_text(encoding="utf-8")
 
@@ -205,9 +206,107 @@ def test_rebuild_code_skips_cluster_when_topology_unchanged(tmp_path, monkeypatc
     monkeypatch.setattr(cluster_mod, "cluster", cluster_once)
     monkeypatch.setattr(cluster_mod, "score_all", lambda _G, comm: {cid: 1.0 for cid in comm})
 
-    assert _rebuild_code(tmp_path)
-    assert _rebuild_code(tmp_path)
+    assert _rebuild_code(tmp_path, no_vector_index=True)
+    assert _rebuild_code(tmp_path, no_vector_index=True)
     assert calls["n"] == 1
+
+
+def test_rebuild_code_refreshes_vector_index_only_when_graph_changes(tmp_path, monkeypatch):
+    from graphify import cluster as cluster_mod
+    from graphify import search_index as search_index_mod
+    from graphify.watch import _rebuild_code
+
+    src = tmp_path / "app.py"
+    src.write_text("def alpha():\n    return 1\n", encoding="utf-8")
+    monkeypatch.setattr(cluster_mod, "cluster", lambda G: {0: sorted(G.nodes())})
+    monkeypatch.setattr(cluster_mod, "score_all", lambda _G, comm: {cid: 1.0 for cid in comm})
+    calls: list[Path] = []
+
+    def fake_build_index(graph_path):
+        calls.append(Path(graph_path))
+        return types.SimpleNamespace(node_count=1, embedding_dim=2, reused_count=0, embedded_count=1)
+
+    monkeypatch.setattr(search_index_mod, "build_index", fake_build_index)
+
+    assert _rebuild_code(tmp_path)
+    assert calls == [tmp_path / "graphify-out" / "graph.json"]
+
+    assert _rebuild_code(tmp_path)
+    assert calls == [tmp_path / "graphify-out" / "graph.json"]
+
+
+def test_rebuild_code_can_skip_vector_index(tmp_path, monkeypatch):
+    from graphify import cluster as cluster_mod
+    from graphify import search_index as search_index_mod
+    from graphify.watch import _rebuild_code
+
+    src = tmp_path / "app.py"
+    src.write_text("def alpha():\n    return 1\n", encoding="utf-8")
+    monkeypatch.setattr(cluster_mod, "cluster", lambda G: {0: sorted(G.nodes())})
+    monkeypatch.setattr(cluster_mod, "score_all", lambda _G, comm: {cid: 1.0 for cid in comm})
+
+    def fail_build_index(_graph_path):
+        raise AssertionError("vector index should be skipped")
+
+    monkeypatch.setattr(search_index_mod, "build_index", fail_build_index)
+
+    assert _rebuild_code(tmp_path, no_vector_index=True)
+
+
+def test_rebuild_code_merges_objc_runtime_edges(tmp_path, monkeypatch):
+    from graphify import cluster as cluster_mod
+    from graphify.watch import _rebuild_code
+    import json
+
+    (tmp_path / "ForwardRegistry.m").write_text(
+        "@implementation ForwardRegistry\n@end\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ForwardHandler.m").write_text(
+        """
+@implementation ForwardHandler
++ (void)load {
+    [ForwardRegistry registerHandlerClass:[self class]];
+}
+@end
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cluster_mod, "cluster", lambda G: {0: sorted(G.nodes())})
+    monkeypatch.setattr(cluster_mod, "score_all", lambda _G, comm: {cid: 1.0 for cid in comm})
+
+    assert _rebuild_code(tmp_path, no_vector_index=True)
+
+    graph = json.loads((tmp_path / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+    assert any(e.get("relation") == "registers_in" for e in graph.get("links", []))
+
+
+def test_rebuild_code_can_skip_objc_runtime_edges(tmp_path, monkeypatch):
+    from graphify import cluster as cluster_mod
+    from graphify.watch import _rebuild_code
+    import json
+
+    (tmp_path / "ForwardRegistry.m").write_text(
+        "@implementation ForwardRegistry\n@end\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ForwardHandler.m").write_text(
+        """
+@implementation ForwardHandler
++ (void)load {
+    [ForwardRegistry registerHandlerClass:[self class]];
+}
+@end
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cluster_mod, "cluster", lambda G: {0: sorted(G.nodes())})
+    monkeypatch.setattr(cluster_mod, "score_all", lambda _G, comm: {cid: 1.0 for cid in comm})
+
+    assert _rebuild_code(tmp_path, no_vector_index=True, no_objc_runtime=True)
+
+    graph = json.loads((tmp_path / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+    assert not any(e.get("relation") == "registers_in" for e in graph.get("links", []))
 
 
 # --- .graphifyignore honored in watch handler (gh-928) ---

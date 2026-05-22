@@ -207,7 +207,10 @@ Code is extracted locally with no API calls (AST via tree-sitter). Everything el
 
 `graphify index` builds a local multilingual vector/alias index beside
 `graph.json` so `graphify query` can match natural-language questions to code
-symbols. Project-specific vocabulary can be supplied in
+symbols. Re-running it is incremental by default: unchanged node embeddings are
+reused, and `--force` rebuilds all vectors. `graphify update` refreshes the
+index automatically after `graph.json` changes unless `--no-vector-index` or
+`GRAPHIFY_NO_VECTOR_INDEX` is set. Project-specific vocabulary can be supplied in
 `graphify-out/graphify.aliases.json`; patterns match both `source_file` and
 symbol labels. graphify does not bake product-specific aliases into the default
 package.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,8 +13,10 @@ from typing import Any
 DEFAULT_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 EMBEDDINGS_FILE = ".graphify_embeddings.npy"
 EMBED_IDS_FILE = ".graphify_embed_ids.json"
+EMBED_TEXT_HASHES_FILE = ".graphify_embed_text_hashes.json"
 ALIAS_INDEX_FILE = ".graphify_alias_index.json"
 METADATA_FILE = ".graphify_search_index.json"
+INDEX_SCHEMA_VERSION = 2
 
 
 # Project/domain-specific path aliases belong in graphify.aliases.json next to
@@ -62,6 +65,8 @@ class IndexBuildResult:
     model_name: str
     out_dir: Path
     alias_count: int
+    reused_count: int = 0
+    embedded_count: int = 0
 
 
 def _load_graph_nodes(graph_path: Path) -> list[dict[str, Any]]:
@@ -99,6 +104,16 @@ def _custom_alias_rules(graph_dir: Path) -> list[tuple[str, tuple[str, ...]]]:
             if pattern and isinstance(aliases, list):
                 rules.append((str(pattern), tuple(str(a) for a in aliases if str(a).strip())))
     return rules
+
+
+def _alias_rules_hash(custom_rules: list[tuple[str, tuple[str, ...]]]) -> str:
+    payload = {
+        "path": PATH_ALIASES,
+        "class": CLASS_ALIASES,
+        "custom": custom_rules,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def generate_aliases(
@@ -140,12 +155,65 @@ def _node_text(node: dict[str, Any], aliases: list[str]) -> str:
     return " ".join(p for p in pieces if p).strip()
 
 
+def _text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _normalize_embeddings(embeddings: Any) -> Any:
+    import numpy as np
+
+    if embeddings.size:
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return (embeddings / norms).astype(np.float32)
+    return embeddings.astype(np.float32)
+
+
+def _graph_stat(graph_path: Path) -> dict[str, int]:
+    try:
+        stat = graph_path.stat()
+        return {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+    except OSError:
+        return {}
+
+
+def _load_reusable_index(graph_dir: Path, model_name: str) -> tuple[dict[str, Any], dict[str, str], int] | None:
+    embed_npy = graph_dir / EMBEDDINGS_FILE
+    embed_ids = graph_dir / EMBED_IDS_FILE
+    hashes_path = graph_dir / EMBED_TEXT_HASHES_FILE
+    metadata_path = graph_dir / METADATA_FILE
+    if not embed_npy.exists() or not embed_ids.exists() or not hashes_path.exists() or not metadata_path.exists():
+        return None
+    try:
+        import numpy as np
+
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("model") != model_name:
+            return None
+        embeddings = np.load(embed_npy)
+        node_ids = [str(nid) for nid in json.loads(embed_ids.read_text(encoding="utf-8"))]
+        text_hashes = {
+            str(nid): str(h)
+            for nid, h in json.loads(hashes_path.read_text(encoding="utf-8")).items()
+        }
+        if embeddings.ndim != 2 or len(node_ids) != embeddings.shape[0]:
+            return None
+        if not all(nid in text_hashes for nid in node_ids):
+            return None
+        by_id = {nid: embeddings[i].astype(np.float32, copy=False) for i, nid in enumerate(node_ids)}
+        dim = int(embeddings.shape[1]) if embeddings.size else int(metadata.get("embedding_dim") or 0)
+        return by_id, text_hashes, dim
+    except Exception:
+        return None
+
+
 def build_index(
     graph_path: str | Path,
     *,
     model_name: str | None = None,
     out_dir: str | Path | None = None,
     batch_size: int = 128,
+    incremental: bool = True,
 ) -> IndexBuildResult:
     graph_path = Path(graph_path).resolve()
     graph_dir = Path(out_dir).resolve() if out_dir else graph_path.parent
@@ -155,8 +223,10 @@ def build_index(
     nodes = _load_graph_nodes(graph_path)
     node_ids: list[str] = []
     texts: list[str] = []
+    text_hashes: dict[str, str] = {}
     alias_index: dict[str, list[str]] = defaultdict(list)
     custom_rules = _custom_alias_rules(graph_dir)
+    alias_rules_hash = _alias_rules_hash(custom_rules)
     for node in nodes:
         node_id = node.get("id")
         if not node_id:
@@ -166,8 +236,11 @@ def build_index(
         aliases = generate_aliases(label, source_file, graph_dir=graph_dir, custom_rules=custom_rules)
         for alias in aliases:
             alias_index[alias].append(str(node_id))
-        node_ids.append(str(node_id))
-        texts.append(_node_text(node, aliases))
+        nid = str(node_id)
+        text = _node_text(node, aliases)
+        node_ids.append(nid)
+        texts.append(text)
+        text_hashes[nid] = _text_hash(text)
 
     try:
         import numpy as np
@@ -175,30 +248,73 @@ def build_index(
     except ImportError as exc:
         raise ImportError("vector search requires numpy and fastembed") from exc
 
-    model = TextEmbedding(model_name=model_name)
-    embeddings = np.array(list(model.embed(texts, batch_size=batch_size, show_progress_bar=False)), dtype=np.float32)
-    if embeddings.size:
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        embeddings = (embeddings / norms).astype(np.float32)
+    reusable = _load_reusable_index(graph_dir, model_name) if incremental else None
+    old_vectors: dict[str, Any] = {}
+    old_hashes: dict[str, str] = {}
+    old_dim = 0
+    if reusable is not None:
+        old_vectors, old_hashes, old_dim = reusable
+
+    rows: list[Any | None] = []
+    embed_texts: list[str] = []
+    embed_positions: list[int] = []
+    reused_count = 0
+    for i, (nid, text) in enumerate(zip(node_ids, texts)):
+        if nid in old_vectors and old_hashes.get(nid) == text_hashes[nid]:
+            rows.append(old_vectors[nid])
+            reused_count += 1
+        else:
+            rows.append(None)
+            embed_texts.append(text)
+            embed_positions.append(i)
+
+    embedded_count = len(embed_texts)
+    if embed_texts:
+        model = TextEmbedding(model_name=model_name)
+        fresh = np.array(
+            list(model.embed(embed_texts, batch_size=batch_size, show_progress_bar=False)),
+            dtype=np.float32,
+        )
+        fresh = _normalize_embeddings(fresh)
+        if reused_count and fresh.size and old_dim and int(fresh.shape[1]) != old_dim:
+            # Model output shape changed despite the same name; rebuild all rows
+            # so the matrix stays rectangular.
+            reused_count = 0
+            embedded_count = len(texts)
+            rows = [None] * len(texts)
+            embed_positions = list(range(len(texts)))
+            fresh = np.array(
+                list(model.embed(texts, batch_size=batch_size, show_progress_bar=False)),
+                dtype=np.float32,
+            )
+            fresh = _normalize_embeddings(fresh)
+        if len(fresh) != len(embed_positions):
+            raise RuntimeError("embedding model returned an unexpected number of vectors")
+        for row_index, graph_index in enumerate(embed_positions):
+            rows[graph_index] = fresh[row_index]
+    elif not node_ids:
+        rows = []
+
+    if rows:
+        if any(row is None for row in rows):
+            raise RuntimeError("embedding model returned an unexpected number of vectors")
+        embeddings = np.vstack([row for row in rows if row is not None]).astype(np.float32)
     else:
-        embeddings = np.empty((0, 0), dtype=np.float32)
+        embeddings = np.empty((0, old_dim if old_dim else 0), dtype=np.float32)
 
     np.save(graph_dir / EMBEDDINGS_FILE, embeddings)
     (graph_dir / EMBED_IDS_FILE).write_text(json.dumps(node_ids, ensure_ascii=False), encoding="utf-8")
+    (graph_dir / EMBED_TEXT_HASHES_FILE).write_text(json.dumps(text_hashes, ensure_ascii=False, indent=2), encoding="utf-8")
     (graph_dir / ALIAS_INDEX_FILE).write_text(json.dumps(dict(alias_index), ensure_ascii=False), encoding="utf-8")
-    try:
-        stat = graph_path.stat()
-        graph_stat = {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
-    except OSError:
-        graph_stat = {}
     metadata = {
+        "schema_version": INDEX_SCHEMA_VERSION,
         "model": model_name,
         "node_count": len(node_ids),
         "embedding_dim": int(embeddings.shape[1]) if embeddings.ndim == 2 and embeddings.size else 0,
         "dtype": str(embeddings.dtype),
         "graph": str(graph_path),
-        "graph_stat": graph_stat,
+        "graph_stat": _graph_stat(graph_path),
+        "alias_rules_hash": alias_rules_hash,
     }
     (graph_dir / METADATA_FILE).write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return IndexBuildResult(
@@ -207,6 +323,8 @@ def build_index(
         model_name=model_name,
         out_dir=graph_dir,
         alias_count=len(alias_index),
+        reused_count=reused_count,
+        embedded_count=embedded_count,
     )
 
 
@@ -221,7 +339,17 @@ def load_index(graph_path: str | Path, cache: dict | None = None) -> tuple[list[
         return None
     try:
         stat = embed_npy.stat()
-        key = (str(graph_dir), stat.st_mtime_ns, stat.st_size)
+        custom_rules = _custom_alias_rules(graph_dir)
+        alias_rules_hash = _alias_rules_hash(custom_rules)
+        current_graph_stat = _graph_stat(graph_path)
+        key = (
+            str(graph_dir),
+            stat.st_mtime_ns,
+            stat.st_size,
+            current_graph_stat.get("mtime_ns"),
+            current_graph_stat.get("size"),
+            alias_rules_hash,
+        )
         if cache is not None and cache.get("key") == key:
             return cache["value"]
         import numpy as np
@@ -229,6 +357,15 @@ def load_index(graph_path: str | Path, cache: dict | None = None) -> tuple[list[
         node_ids = json.loads(embed_ids.read_text(encoding="utf-8"))
         aliases = json.loads(alias_index_path.read_text(encoding="utf-8")) if alias_index_path.exists() else {}
         metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+        if metadata.get("schema_version", 1) >= INDEX_SCHEMA_VERSION:
+            if metadata.get("graph_stat") != current_graph_stat:
+                return None
+            if metadata.get("alias_rules_hash") != alias_rules_hash:
+                return None
+            if int(metadata.get("node_count") or 0) != len(node_ids):
+                return None
+            if embeddings.ndim != 2 or embeddings.shape[0] != len(node_ids):
+                return None
         value = (node_ids, embeddings, aliases, metadata)
         if cache is not None:
             cache["key"] = key

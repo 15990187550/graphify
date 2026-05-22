@@ -1233,11 +1233,14 @@ def main() -> None:
         print("    --force                 overwrite graph.json even if the rebuild has fewer nodes")
         print("                            (also: GRAPHIFY_FORCE=1 env var; use after refactors that delete code)")
         print("    --no-cluster            skip clustering, write raw extraction only")
+        print("    --no-vector-index       skip automatic vector index refresh")
+        print("    --no-objc-runtime       skip Objective-C runtime/convention edges")
         print("  cluster-only <path>     rerun clustering on an existing graph.json and regenerate report")
         print("    --no-viz                skip graph.html generation (useful for >5000 node graphs / CI)")
         print("    --graph <path>          path to graph.json (default <path>/graphify-out/graph.json)")
-        print("  index [--graph path]    build vector search index for graph.json")
+        print("  index [--graph path]    build/update vector search index for graph.json")
         print("    --model M               embedding model (default multilingual MiniLM)")
+        print("    --force                 rebuild all embeddings instead of incremental reuse")
         print("  query \"<question>\"       BFS traversal of graph.json for a question")
         print("    --dfs                   use depth-first instead of breadth-first")
         print("    --depth N               traversal depth (default: 2)")
@@ -1495,6 +1498,7 @@ def main() -> None:
         from graphify.search_index import build_index
         graph_path = _default_graph_path()
         model_name: str | None = None
+        force = False
         args = sys.argv[2:]
         i = 0
         while i < len(args):
@@ -1507,6 +1511,7 @@ def main() -> None:
             elif args[i].startswith("--model="):
                 model_name = args[i].split("=", 1)[1]; i += 1
             elif args[i] == "--force":
+                force = True
                 i += 1
             else:
                 i += 1
@@ -1515,13 +1520,14 @@ def main() -> None:
             print(f"error: graph file not found: {gp}", file=sys.stderr)
             sys.exit(1)
         try:
-            result = build_index(gp, model_name=model_name)
+            result = build_index(gp, model_name=model_name, incremental=not force)
         except ImportError as exc:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(1)
         print(
             f"Index written: {result.node_count} nodes, "
-            f"{result.embedding_dim} dims, {result.alias_count} aliases -> {result.out_dir}"
+            f"{result.embedding_dim} dims, {result.alias_count} aliases, "
+            f"reused {result.reused_count}, embedded {result.embedded_count} -> {result.out_dir}"
         )
     elif cmd == "query":
         if len(sys.argv) < 3:
@@ -1932,6 +1938,8 @@ def main() -> None:
     elif cmd == "update":
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
         no_cluster = False
+        no_vector_index = False
+        no_objc_runtime = False
         args = sys.argv[2:]
         watch_arg: str | None = None
         for a in args:
@@ -1940,6 +1948,12 @@ def main() -> None:
                 continue
             if a == "--no-cluster":
                 no_cluster = True
+                continue
+            if a == "--no-vector-index":
+                no_vector_index = True
+                continue
+            if a == "--no-objc-runtime":
+                no_objc_runtime = True
                 continue
             if a.startswith("-"):
                 print(f"error: unknown update option: {a}", file=sys.stderr)
@@ -1966,7 +1980,14 @@ def main() -> None:
         # Interactive CLI: block on the per-repo lock rather than skip, so the
         # user sees their explicit `graphify update` complete instead of
         # exiting silently when a hook-driven rebuild happens to be running.
-        ok = _rebuild_code(watch_path, force=force, no_cluster=no_cluster, block_on_lock=True)
+        ok = _rebuild_code(
+            watch_path,
+            force=force,
+            no_cluster=no_cluster,
+            no_vector_index=no_vector_index,
+            no_objc_runtime=no_objc_runtime,
+            block_on_lock=True,
+        )
         if ok:
             print("Code graph updated. For doc/paper/image changes run /graphify --update in your AI assistant.")
             if not (
