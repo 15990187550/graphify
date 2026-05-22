@@ -42,6 +42,31 @@ def test_cache_roundtrip(tmp_file, cache_root):
     assert loaded == result
 
 
+def test_cache_miss_on_extractor_change(tmp_file, cache_root):
+    """AST cache entries are invalidated when the selected extractor changes."""
+    result = {"nodes": [{"id": "n1", "label": "Node1"}], "edges": []}
+    save_cached(tmp_file, result, root=cache_root, extractor="extract_c")
+
+    assert load_cached(tmp_file, root=cache_root, extractor="extract_c") == result
+    assert load_cached(tmp_file, root=cache_root, extractor="extract_objc") is None
+
+
+def test_cache_metadata_is_not_returned_without_extractor(tmp_file, cache_root):
+    """Internal cache metadata is never exposed as extraction payload."""
+    result = {"nodes": [{"id": "n1", "label": "Node1"}], "edges": []}
+    save_cached(tmp_file, result, root=cache_root, extractor="extract_c")
+
+    assert load_cached(tmp_file, root=cache_root) == result
+
+
+def test_legacy_ast_cache_misses_when_extractor_required(tmp_file, cache_root):
+    """Old AST cache entries without extractor metadata should not mask parser changes."""
+    result = {"nodes": [], "edges": []}
+    save_cached(tmp_file, result, root=cache_root)
+
+    assert load_cached(tmp_file, root=cache_root, extractor="extract_objc") is None
+
+
 def test_cache_miss_on_change(tmp_file, cache_root):
     """After file content changes, load_cached returns None."""
     result = {"nodes": [], "edges": [{"source": "a", "target": "b"}]}

@@ -33,6 +33,8 @@ def _body_content(content: bytes) -> bytes:
 _stat_index: dict[str, dict] = {}
 _stat_index_root: Path | None = None
 _stat_index_dirty: bool = False
+_CACHE_META_KEY = "_graphify_cache"
+_AST_CACHE_SCHEMA_VERSION = 2
 
 
 def _stat_index_file(root: Path) -> Path:
@@ -159,7 +161,26 @@ def cache_dir(root: Path = Path("."), kind: str = "ast") -> Path:
     return d
 
 
-def load_cached(path: Path, root: Path = Path("."), kind: str = "ast") -> dict | None:
+def _read_cache_entry(entry: Path, *, kind: str, extractor: str | None) -> dict | None:
+    try:
+        data = json.loads(entry.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if kind == "ast" and extractor is not None:
+        meta = data.get(_CACHE_META_KEY)
+        if (
+            not isinstance(meta, dict)
+            or meta.get("schema_version") != _AST_CACHE_SCHEMA_VERSION
+            or meta.get("extractor") != extractor
+        ):
+            return None
+    if isinstance(data, dict):
+        data = dict(data)
+        data.pop(_CACHE_META_KEY, None)
+    return data
+
+
+def load_cached(path: Path, root: Path = Path("."), kind: str = "ast", extractor: str | None = None) -> dict | None:
     """Return cached extraction for this file if hash matches, else None.
 
     Cache key: SHA256 of file contents.
@@ -175,22 +196,16 @@ def load_cached(path: Path, root: Path = Path("."), kind: str = "ast") -> dict |
         return None
     entry = cache_dir(root, kind) / f"{h}.json"
     if entry.exists():
-        try:
-            return json.loads(entry.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return None
+        return _read_cache_entry(entry, kind=kind, extractor=extractor)
     # Migration fallback: check legacy flat cache/ dir for AST entries
     if kind == "ast":
         legacy = Path(root).resolve() / _GRAPHIFY_OUT / "cache" / f"{h}.json"
         if legacy.exists():
-            try:
-                return json.loads(legacy.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                return None
+            return _read_cache_entry(legacy, kind=kind, extractor=extractor)
     return None
 
 
-def save_cached(path: Path, result: dict, root: Path = Path("."), kind: str = "ast") -> None:
+def save_cached(path: Path, result: dict, root: Path = Path("."), kind: str = "ast", extractor: str | None = None) -> None:
     """Save extraction result for this file.
 
     Stores as graphify-out/cache/{kind}/{hash}.json where hash = SHA256 of current file contents.
@@ -206,9 +221,16 @@ def save_cached(path: Path, result: dict, root: Path = Path("."), kind: str = "a
     h = file_hash(p, root)
     target_dir = cache_dir(root, kind)
     entry = target_dir / f"{h}.json"
+    payload = result
+    if kind == "ast" and extractor is not None:
+        payload = dict(result)
+        payload[_CACHE_META_KEY] = {
+            "schema_version": _AST_CACHE_SCHEMA_VERSION,
+            "extractor": extractor,
+        }
     fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=f"{h}.", suffix=".tmp")
     try:
-        os.write(fd, json.dumps(result).encode())
+        os.write(fd, json.dumps(payload).encode())
         os.close(fd)
         try:
             os.replace(tmp_path, entry)

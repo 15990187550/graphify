@@ -4465,6 +4465,17 @@ def extract_objc(path: Path) -> dict:
     method_bodies: list[tuple[str, Any]] = []
     class_name_to_nid: dict[str, str] = {}
     pending_inherits: list[tuple[str, str, int]] = []
+    raw_calls: list[dict] = []
+    raw_references: list[dict] = []
+    objc_builtin_types = {
+        "id", "BOOL", "NSInteger", "NSUInteger", "CGFloat", "int", "float", "double",
+        "char", "long", "short", "void", "SEL", "Class", "NSString", "NSArray",
+        "NSMutableArray", "NSDictionary", "NSMutableDictionary", "NSSet", "NSNumber",
+        "NSData", "NSDate", "NSURL", "NSError", "NSObject", "UIImage", "UIColor",
+        "UIFont", "UIView", "UIViewController", "UITableView", "UICollectionView",
+        "UIScrollView", "UILabel", "UIButton", "UIImageView", "UITextField", "UITextView",
+        "instancetype",
+    }
 
     def add_node(nid: str, label: str, line: int) -> None:
         if nid not in seen_ids:
@@ -4502,22 +4513,25 @@ def extract_objc(path: Path) -> dict:
 
         if t == "preproc_include":
             # #import <Foundation/Foundation.h> or #import "MyClass.h"
+            def add_import(raw: str, *, keep_path: bool = False) -> None:
+                module = raw.split("/")[-1].replace(".h", "")
+                if module:
+                    add_edge(file_nid, _make_id(module), "imports", line, context="import")
+                if keep_path:
+                    module_path = re.sub(r"\.h$", "", raw)
+                    if "/" in module_path:
+                        add_edge(file_nid, _make_id(module_path), "imports", line, context="import")
+
             for child in node.children:
                 if child.type == "system_lib_string":
                     raw = _read(child).strip("<>")
-                    module = raw.split("/")[-1].replace(".h", "")
-                    if module:
-                        tgt_nid = _make_id(module)
-                        add_edge(file_nid, tgt_nid, "imports", line, context="import")
+                    add_import(raw)
                 elif child.type == "string_literal":
                     # recurse into string_literal to find string_content
                     for sub in child.children:
                         if sub.type == "string_content":
                             raw = _read(sub)
-                            module = raw.split("/")[-1].replace(".h", "")
-                            if module:
-                                tgt_nid = _make_id(module)
-                                add_edge(file_nid, tgt_nid, "imports", line, context="import")
+                            add_import(raw, keep_path=True)
             return
 
         if t == "class_interface":
@@ -4634,6 +4648,41 @@ def extract_objc(path: Path) -> dict:
             add_node(super_nid, super_name, line)
         add_edge(cls_nid, super_nid, "inherits", line)
 
+    def add_raw_reference(source_nid: str, type_name: str, offset: int) -> None:
+        if not type_name or type_name in objc_builtin_types or not type_name[0].isupper():
+            return
+        if class_name_to_nid.get(type_name) == source_nid:
+            return
+        line = text_source.count("\n", 0, offset) + 1
+        raw_references.append({
+            "source_nid": source_nid,
+            "target_name": type_name,
+            "source_file": str_path,
+            "source_location": f"L{line}",
+        })
+
+    # Text fallback for ObjC type references. tree-sitter-objc exposes many
+    # declarations differently across versions; these patterns catch the common
+    # source-level evidence that connects models, handlers, and view controllers.
+    for class_match in re.finditer(r"@(interface|implementation)\s+([A-Za-z_]\w*)\b", text_source):
+        class_name = class_match.group(2)
+        source_nid = class_name_to_nid.get(class_name)
+        if not source_nid:
+            continue
+        end_match = re.search(r"@end\b", text_source[class_match.end():])
+        end = class_match.end() + end_match.end() if end_match else len(text_source)
+        block = text_source[class_match.start():end]
+        block_offset = class_match.start()
+        for pattern in (
+            r"\b([A-Z][A-Za-z_0-9]+)\s*(?:<[^>]+>)?\s*\*+\s*[A-Za-z_]\w*",
+            r"\(\s*([A-Z][A-Za-z_0-9]+)\s*(?:<[^>]+>)?\s*\*?\s*\)\s*[A-Za-z_]\w*",
+            r"\[\s*([A-Z][A-Za-z_0-9]+)\s+class\]",
+        ):
+            for type_match in re.finditer(pattern, block):
+                add_raw_reference(source_nid, type_match.group(1), block_offset + type_match.start())
+        for generic_match in re.finditer(r"<\s*([A-Z][A-Za-z_0-9]+)\s*\*?\s*>", block):
+            add_raw_reference(source_nid, generic_match.group(1), block_offset + generic_match.start())
+
     # Second pass: resolve calls inside method bodies
     all_method_nids = {n["id"] for n in nodes if n["id"] != file_nid}
     seen_calls: set[tuple[str, str]] = set()
@@ -4668,16 +4717,31 @@ def extract_objc(path: Path) -> dict:
         for match in re.finditer(r"\[\s*([A-Z][A-Za-z_0-9]*)\s+(new|alloc|allocWithZone|shared\w*|default\w*)\b", body_text):
             class_name = match.group(1)
             class_nid = class_name_to_nid.get(class_name)
-            if not class_nid or class_nid == caller_nid:
-                continue
             line = body_node.start_point[0] + body_text.count("\n", 0, match.start()) + 1
+            if not class_nid or class_nid == caller_nid:
+                if not class_nid:
+                    raw_calls.append({
+                        "caller_nid": caller_nid,
+                        "callee": class_name,
+                        "source_file": str_path,
+                        "source_location": f"L{line}",
+                        "is_objc_class_call": True,
+                    })
+                continue
             pair = (caller_nid, class_nid)
             if pair not in seen_calls:
                 seen_calls.add(pair)
                 add_edge(caller_nid, class_nid, "calls", line,
                          confidence="EXTRACTED", weight=1.0, context="call")
 
-    return {"nodes": nodes, "edges": edges, "input_tokens": 0, "output_tokens": 0}
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "raw_calls": raw_calls,
+        "raw_references": raw_references,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
 
 
 def extract_elixir(path: Path) -> dict:
@@ -6253,10 +6317,20 @@ _DISPATCH: dict[str, Any] = {
 }
 
 
+def _looks_like_objc_header(path: Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return bool(re.search(r"^\s*@(interface|implementation|protocol|class|property|optional|required|end)\b", text, re.M))
+
+
 def _get_extractor(path: Path) -> Any | None:
     """Return the correct extractor function for a file, or None if unsupported."""
     if path.name.endswith(".blade.php"):
         return extract_blade
+    if path.suffix == ".h" and _looks_like_objc_header(path):
+        return extract_objc
     return _DISPATCH.get(path.suffix)
 
 
@@ -6277,18 +6351,18 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     cache_root = Path(cache_root_str)
     _raise_recursion_limit()
 
-    # Check cache first (avoid re-extraction)
-    cached = load_cached(path, cache_root)
-    if cached is not None:
-        return idx, cached
-
     extractor = _get_extractor(path)
     if extractor is None:
         return idx, {"nodes": [], "edges": []}
 
+    # Check cache after selecting the extractor so parser changes invalidate AST entries.
+    cached = load_cached(path, cache_root, extractor=extractor.__name__)
+    if cached is not None:
+        return idx, cached
+
     result = _safe_extract(extractor, path)
     if "error" not in result:
-        save_cached(path, result, cache_root)
+        save_cached(path, result, cache_root, extractor=extractor.__name__)
     return idx, result
 
 
@@ -6395,7 +6469,7 @@ def _extract_sequential(
             continue
         result = _safe_extract(extractor, path)
         if "error" not in result:
-            save_cached(path, result, effective_root)
+            save_cached(path, result, effective_root, extractor=extractor.__name__)
         per_file[idx] = result
     if total_files >= _PROGRESS_INTERVAL:
         print(f"  AST extraction: {total_files}/{total_files} files (100%)", flush=True)
@@ -6458,10 +6532,11 @@ def extract(
     uncached_work: list[tuple[int, Path]] = []
 
     for i, path in enumerate(paths):
-        if _get_extractor(path) is None:
+        extractor = _get_extractor(path)
+        if extractor is None:
             per_file[i] = {"nodes": [], "edges": []}
             continue
-        cached = load_cached(path, effective_root)
+        cached = load_cached(path, effective_root, extractor=extractor.__name__)
         if cached is not None:
             per_file[i] = cached
             continue
@@ -6529,6 +6604,143 @@ def extract(
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Java cross-file import resolution failed, skipping: %s", exc)
+
+    # Cross-file Objective-C type references and class-factory messages.
+    # ObjC code often connects modules through `#import`, typed properties,
+    # generics, and `[[Class alloc] init]` rather than direct same-file calls.
+    objc_paths = [p for p in paths if p.suffix.lower() in {".m", ".mm", ".h"}]
+    if objc_paths:
+        label_to_objc_nids: dict[str, list[str]] = {}
+        nid_to_source_file: dict[str, str] = {}
+        for n in all_nodes:
+            label = str(n.get("label") or "")
+            if (
+                not label
+                or label.startswith("-")
+                or label.startswith("+")
+                or label.endswith("()")
+                or label.endswith((".h", ".m", ".mm"))
+            ):
+                continue
+            sf = str(n.get("source_file") or "")
+            if Path(sf).suffix.lower() not in {".m", ".mm", ".h"}:
+                continue
+            key = label.lower().strip("<>")
+            if n["id"] not in label_to_objc_nids.setdefault(key, []):
+                label_to_objc_nids[key].append(n["id"])
+            nid_to_source_file.setdefault(n["id"], sf)
+
+        file_to_imported_modules: dict[str, set[str]] = {}
+        for e in all_edges:
+            if e.get("relation") != "imports":
+                continue
+            src = e.get("source")
+            if not src:
+                continue
+            file_to_imported_modules.setdefault(src, set()).add(str(e.get("target") or ""))
+
+        def _file_nid_for_source(sf: str) -> str:
+            sf_path = Path(sf)
+            try:
+                sf_rel = sf_path.relative_to(root) if sf_path.is_absolute() else sf_path
+            except ValueError:
+                sf_rel = sf_path
+            return _make_id(str(sf_rel))
+
+        def _objc_source_path_keys(sf: str) -> set[str]:
+            sf_path = Path(sf)
+            try:
+                sf_rel = sf_path.relative_to(root) if sf_path.is_absolute() else sf_path
+            except ValueError:
+                sf_rel = sf_path
+            return {_make_id(sf_rel.with_suffix("").as_posix())}
+
+        def _pick_objc_target(type_name: str, source_file: str) -> str | None:
+            candidates = label_to_objc_nids.get(type_name.lower(), [])
+            if not candidates:
+                return None
+            if len(candidates) == 1:
+                return candidates[0]
+            imported = file_to_imported_modules.get(_file_nid_for_source(source_file), set())
+            if imported:
+                path_matches = [
+                    nid for nid in candidates
+                    if _objc_source_path_keys(nid_to_source_file.get(nid, "")) & imported
+                ]
+                header_path_matches = [
+                    nid for nid in path_matches
+                    if nid_to_source_file.get(nid, "").endswith(".h")
+                ]
+                if len(header_path_matches) == 1:
+                    return header_path_matches[0]
+                if len(path_matches) == 1:
+                    return path_matches[0]
+                imported_matches: list[str] = []
+                for nid in candidates:
+                    sf = nid_to_source_file.get(nid, "")
+                    stem_key = _make_id(Path(sf).stem)
+                    label_key = _make_id(type_name)
+                    if stem_key in imported or label_key in imported:
+                        imported_matches.append(nid)
+                header_matches = [
+                    nid for nid in imported_matches
+                    if nid_to_source_file.get(nid, "").endswith(".h")
+                ]
+                if len(header_matches) == 1:
+                    return header_matches[0]
+                if len(imported_matches) == 1:
+                    return imported_matches[0]
+            return None
+
+        existing_edge_keys = {
+            (e.get("source"), e.get("target"), e.get("relation"), e.get("context"))
+            for e in all_edges
+        }
+
+        def _add_objc_edge(source: str, target_name: str, source_file: str,
+                           source_location: str | None, relation: str, context: str,
+                           confidence: str) -> None:
+            target = _pick_objc_target(target_name, source_file)
+            if not target or target == source:
+                return
+            key = (source, target, relation, context)
+            if key in existing_edge_keys:
+                return
+            existing_edge_keys.add(key)
+            all_edges.append({
+                "source": source,
+                "target": target,
+                "relation": relation,
+                "context": context,
+                "confidence": confidence,
+                "confidence_score": 1.0 if confidence == "EXTRACTED" else 0.8,
+                "source_file": source_file,
+                "source_location": source_location,
+                "weight": 1.0,
+            })
+
+        for result in per_file:
+            for ref in result.get("raw_references", []):
+                _add_objc_edge(
+                    ref.get("source_nid", ""),
+                    ref.get("target_name", ""),
+                    ref.get("source_file", ""),
+                    ref.get("source_location"),
+                    "references",
+                    "type",
+                    "EXTRACTED",
+                )
+            for call in result.get("raw_calls", []):
+                if call.get("is_objc_class_call"):
+                    _add_objc_edge(
+                        call.get("caller_nid", ""),
+                        call.get("callee", ""),
+                        call.get("source_file", ""),
+                        call.get("source_location"),
+                        "calls",
+                        "call",
+                        "EXTRACTED",
+                    )
 
     # Cross-file call resolution for all languages
     # Each extractor saved unresolved calls in raw_calls. Now that we have all

@@ -700,6 +700,212 @@ def test_objc_class_new_message_calls_class_node(tmp_path):
     )
 
 
+def test_objc_cross_file_type_references_and_class_alloc_calls(tmp_path):
+    from graphify.extract import extract
+
+    model_h = tmp_path / "PopoSessionTranspondMessage.h"
+    model_h.write_text(
+        """
+@interface PopoSessionTranspondMessage : NSObject
+@end
+""",
+        encoding="utf-8",
+    )
+    model_mm = tmp_path / "PopoSessionTranspondMessage.mm"
+    model_mm.write_text(
+        """
+#import "PopoSessionTranspondMessage.h"
+@implementation PopoSessionTranspondMessage
+@end
+""",
+        encoding="utf-8",
+    )
+    handler_mm = tmp_path / "PopoSessionTranspondMessageHandler.mm"
+    handler_mm.write_text(
+        """
+#import "PopoSessionTranspondMessage.h"
+
+@implementation PopoSessionTranspondMessageHandler
+- (void)go {
+    PopoSessionTranspondMessage *msg = [[PopoSessionTranspondMessage alloc] init];
+    if ([msg isKindOfClass:[PopoSessionTranspondMessage class]]) {
+    }
+}
+@end
+""",
+        encoding="utf-8",
+    )
+    alert_mm = tmp_path / "PopoTranspondAlertViewController.mm"
+    alert_mm.write_text(
+        """
+#import "PopoSessionTranspondMessage.h"
+
+@interface PopoTranspondAlertViewController : NSObject
+@property (nonatomic, strong) NSArray<PopoSessionTranspondMessage *> *transpondMessages;
+@end
+
+@implementation PopoTranspondAlertViewController
+- (instancetype)initWithTranspondMessage:(PopoSessionTranspondMessage *)message {
+    return [super init];
+}
+@end
+""",
+        encoding="utf-8",
+    )
+
+    result = extract(
+        [model_h, model_mm, handler_mm, alert_mm],
+        cache_root=tmp_path / "cache",
+        parallel=False,
+    )
+    labels = {n["id"]: n["label"] for n in result["nodes"]}
+    edges = result["edges"]
+
+    assert any(
+        labels.get(e["source"]) == "-go"
+        and labels.get(e["target"]) == "PopoSessionTranspondMessage"
+        for e in edges
+        if e["relation"] == "calls"
+    )
+    assert any(
+        labels.get(e["source"]) == "PopoSessionTranspondMessageHandler"
+        and labels.get(e["target"]) == "PopoSessionTranspondMessage"
+        for e in edges
+        if e["relation"] == "references" and e.get("context") == "type"
+    )
+    assert any(
+        labels.get(e["source"]) == "PopoTranspondAlertViewController"
+        and labels.get(e["target"]) == "PopoSessionTranspondMessage"
+        for e in edges
+        if e["relation"] == "references" and e.get("context") == "type"
+    )
+
+
+def test_objc_header_type_references_are_extracted(tmp_path):
+    from graphify.extract import extract
+
+    model_h = tmp_path / "PopoSessionTranspondMessage.h"
+    model_h.write_text(
+        """
+@interface PopoSessionTranspondMessage : NSObject
+@end
+""",
+        encoding="utf-8",
+    )
+    alert_h = tmp_path / "PopoTranspondAlertViewController.h"
+    alert_h.write_text(
+        """
+#import "PopoSessionTranspondMessage.h"
+
+@interface PopoTranspondAlertViewController : NSObject
+@property (nonatomic, strong) NSArray<PopoSessionTranspondMessage *> *transpondMessages;
+@end
+""",
+        encoding="utf-8",
+    )
+
+    result = extract([model_h, alert_h], cache_root=tmp_path / "cache", parallel=False)
+    labels = {n["id"]: n["label"] for n in result["nodes"]}
+
+    assert "PopoSessionTranspondMessage" in labels.values()
+    assert "PopoTranspondAlertViewController" in labels.values()
+    assert any(
+        labels.get(e["source"]) == "PopoTranspondAlertViewController"
+        and labels.get(e["target"]) == "PopoSessionTranspondMessage"
+        for e in result["edges"]
+        if e["relation"] == "references" and e.get("context") == "type"
+    )
+
+
+def test_objc_header_extract_ignores_legacy_c_header_cache(tmp_path):
+    from graphify.cache import save_cached
+    from graphify.extract import extract
+
+    header = tmp_path / "PopoSessionTranspondMessage.h"
+    header.write_text(
+        """
+@interface PopoSessionTranspondMessage : NSObject
+@end
+""",
+        encoding="utf-8",
+    )
+    cache_root = tmp_path / "cache"
+    save_cached(
+        header,
+        {"nodes": [{"id": "stale", "label": "PopoSessionTranspondMessage.h"}], "edges": []},
+        root=cache_root,
+    )
+
+    result = extract([header], cache_root=cache_root, parallel=False)
+
+    assert "PopoSessionTranspondMessage" in {n["label"] for n in result["nodes"]}
+    assert "stale" not in {n["id"] for n in result["nodes"]}
+
+
+def test_c_header_keeps_c_dispatcher(tmp_path):
+    from graphify.extract import _get_extractor
+
+    header = tmp_path / "math_utils.h"
+    header.write_text(
+        """
+/* Mentions @interface in a comment but remains plain C. */
+typedef struct Point {
+    int x;
+    int y;
+} Point;
+int distance(Point *point);
+""",
+        encoding="utf-8",
+    )
+
+    assert _get_extractor(header) is extract_c
+
+
+def test_objc_import_path_disambiguates_duplicate_header_labels(tmp_path):
+    from graphify.extract import extract
+
+    feature_dir = tmp_path / "Feature"
+    tests_dir = tmp_path / "Tests"
+    feature_dir.mkdir()
+    tests_dir.mkdir()
+    (feature_dir / "PopoSessionTranspondMessage.h").write_text(
+        "@interface PopoSessionTranspondMessage : NSObject\n@end\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "PopoSessionTranspondMessage.h").write_text(
+        "@interface PopoSessionTranspondMessage : NSObject\n@end\n",
+        encoding="utf-8",
+    )
+    handler = tmp_path / "PopoSessionTranspondMessageHandler.mm"
+    handler.write_text(
+        """
+#import "Feature/PopoSessionTranspondMessage.h"
+
+@implementation PopoSessionTranspondMessageHandler
+- (void)go {
+    PopoSessionTranspondMessage *message = nil;
+}
+@end
+""",
+        encoding="utf-8",
+    )
+
+    result = extract(
+        [feature_dir / "PopoSessionTranspondMessage.h", tests_dir / "PopoSessionTranspondMessage.h", handler],
+        cache_root=tmp_path / "cache",
+        parallel=False,
+    )
+    nodes = {n["id"]: n for n in result["nodes"]}
+    edge = next(
+        e for e in result["edges"]
+        if e["relation"] == "references"
+        and e.get("context") == "type"
+        and nodes[e["source"]]["label"] == "PopoSessionTranspondMessageHandler"
+    )
+
+    assert nodes[edge["target"]]["source_file"].endswith("Feature/PopoSessionTranspondMessage.h")
+
+
 # ---------------------------------------------------------------------------
 # Go
 # ---------------------------------------------------------------------------

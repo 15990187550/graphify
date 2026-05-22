@@ -2849,14 +2849,14 @@ def main() -> None:
                 sem_result["input_tokens"] += fresh.get("input_tokens", 0)
                 sem_result["output_tokens"] += fresh.get("output_tokens", 0)
 
-        # Merge AST + semantic. Order matters for deduplication: passing AST
-        # first means semantic node attributes win on collision (richer labels
-        # for symbols also referenced in docs). Hyperedges only come from the
-        # semantic side.
+        # Merge runtime + AST + semantic. Order matters for deduplication:
+        # runtime ObjC edges may target the same class IDs as AST nodes, so AST
+        # follows runtime to preserve precise source locations. Semantic still
+        # wins on collision because it can carry richer cross-document context.
         merged: dict = {
             "nodes": (
-                list(ast_result.get("nodes", []))
-                + list(runtime_result.get("nodes", []))
+                list(runtime_result.get("nodes", []))
+                + list(ast_result.get("nodes", []))
                 + list(sem_result.get("nodes", []))
             ),
             "edges": (

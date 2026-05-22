@@ -5,7 +5,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-from graphify.extract import _make_id
+from graphify.extract import _file_stem, _make_id
 
 
 _SYSTEM_PREFIXES = (
@@ -33,6 +33,14 @@ def _rel(path: Path, root: Path) -> str:
 def _node_id(rel_path: str) -> str:
     p = Path(rel_path)
     return _make_id(p.parent.name, p.stem)
+
+
+def _file_node_id(rel_path: str) -> str:
+    return _make_id(rel_path)
+
+
+def _symbol_node_id(rel_path: str, symbol_name: str) -> str:
+    return _make_id(_file_stem(Path(rel_path)), symbol_name)
 
 
 def _class_or_protocol_is_system(name: str) -> bool:
@@ -79,6 +87,7 @@ def extract_objc_runtime(root: str | Path, *, extra_excludes: list[str] | None =
     factory_regs: dict[str, list[str]] = defaultdict(list)
     protocol_methods: dict[str, set[str]] = defaultdict(set)
     impl_methods_by_class: dict[tuple[str, str], set[str]] = defaultdict(set)
+    file_primary_symbol: dict[str, str] = {}
 
     for path in _iter_objc_files(root, extra_excludes=extra_excludes):
         try:
@@ -99,6 +108,12 @@ def extract_objc_runtime(root: str | Path, *, extra_excludes: list[str] | None =
         for match in re.finditer(r"@implementation\s+(\w+)", content):
             cls = match.group(1)
             file_class_name[rel_path] = cls
+            file_primary_symbol[rel_path] = cls
+
+        for match in re.finditer(r"@interface\s+(\w+)\b(?!\s*\()", content):
+            cls = match.group(1)
+            if not _class_or_protocol_is_system(cls):
+                file_primary_symbol.setdefault(rel_path, cls)
 
         if is_impl:
             for match in re.finditer(r"(?:self\.|_)(\w+(?:Handler|Manager|Center|Helper|Delegate|Builder|Provider|DataSource))\b", content):
@@ -129,6 +144,7 @@ def extract_objc_runtime(root: str | Path, *, extra_excludes: list[str] | None =
             proto = match.group(1)
             if not _class_or_protocol_is_system(proto):
                 protocol_defs[proto] = rel_path
+                file_primary_symbol.setdefault(rel_path, proto)
         for match in re.finditer(r"@interface\s+(\w+)\s*(?::\s*\w+\s*)?<([^>]+)>", content):
             cls = match.group(1)
             for proto in (p.strip() for p in match.group(2).split(",")):
@@ -185,26 +201,45 @@ def extract_objc_runtime(root: str | Path, *, extra_excludes: list[str] | None =
     seen_edges: set[tuple[str, str, str, str | None]] = set()
 
     def add_node(rel_path: str) -> str:
-        if rel_path not in nodes:
-            nodes[rel_path] = {
-                "id": _node_id(rel_path),
+        symbol = file_primary_symbol.get(rel_path)
+        node_id = _symbol_node_id(rel_path, symbol) if symbol else _node_id(rel_path)
+        if node_id not in nodes:
+            nodes[node_id] = {
+                "id": node_id,
+                "label": symbol or Path(rel_path).name,
+                "file_type": "code",
+                "source_file": rel_path,
+                "source_location": None,
+            }
+        return node_id
+
+    def add_file_node(rel_path: str) -> str:
+        node_id = _file_node_id(rel_path)
+        if node_id not in nodes:
+            nodes[node_id] = {
+                "id": node_id,
                 "label": Path(rel_path).name,
                 "file_type": "code",
                 "source_file": rel_path,
                 "source_location": None,
             }
-        return nodes[rel_path]["id"]
+        return node_id
 
-    def add_edge(src_file: str, tgt_file: str, relation: str, score: float, location: str, context: str) -> None:
+    def add_edge(src_file: str, tgt_file: str, relation: str, score: float, location: str | None,
+                 context: str, *, file_nodes: bool = False) -> None:
         if not src_file or not tgt_file or src_file == tgt_file:
             return
-        key = (src_file, tgt_file, relation, location)
+        src_id = add_file_node(src_file) if file_nodes else add_node(src_file)
+        tgt_id = add_file_node(tgt_file) if file_nodes else add_node(tgt_file)
+        if src_id == tgt_id and relation != "paired_with":
+            return
+        key = (src_id, tgt_id, relation, location)
         if key in seen_edges:
             return
         seen_edges.add(key)
         edges.append({
-            "source": add_node(src_file),
-            "target": add_node(tgt_file),
+            "source": src_id,
+            "target": tgt_id,
             "relation": relation,
             "confidence": "INFERRED",
             "confidence_score": score,
@@ -270,16 +305,16 @@ def extract_objc_runtime(root: str | Path, *, extra_excludes: list[str] | None =
 
     explicit = {(e["source"], e["target"]) for e in edges if e["relation"] == "conforms_to"}
     for proto, required in protocol_methods.items():
-        if not required:
+        if len(required) < 3:
             continue
         proto_file = protocol_defs.get(proto)
         if not proto_file:
             continue
-        threshold = max(2, int(len(required) * 0.4))
+        threshold = max(3, int(len(required) * 0.6))
         for (rel_path, _cls), methods in impl_methods_by_class.items():
             overlap = methods & required
-            src_id = _node_id(rel_path)
-            tgt_id = _node_id(proto_file)
+            src_id = add_node(rel_path)
+            tgt_id = add_node(proto_file)
             if len(overlap) >= threshold and (src_id, tgt_id) not in explicit:
                 add_edge(rel_path, proto_file, "conforms_to", 0.6, f"implicit: {len(overlap)}/{len(required)} methods match @protocol {proto}", "protocol")
                 explicit.add((src_id, tgt_id))
@@ -293,7 +328,7 @@ def extract_objc_runtime(root: str | Path, *, extra_excludes: list[str] | None =
         impls = [p for p in variants if p.endswith((".m", ".mm", ".cc", ".cpp"))]
         for header in headers:
             for impl in impls:
-                add_edge(header, impl, "paired_with", 0.95, None, "pairing")
+                add_edge(header, impl, "paired_with", 0.95, None, "pairing", file_nodes=True)
 
     return {
         "nodes": list(nodes.values()),
@@ -308,4 +343,3 @@ def write_runtime_edges(root: str | Path, out_path: str | Path, *, extra_exclude
     result = extract_objc_runtime(root, extra_excludes=extra_excludes)
     Path(out_path).write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     return result
-

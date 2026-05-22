@@ -131,6 +131,58 @@ def _pick_seeds(scored: list[tuple[float, str]], max_k: int = 3, gap_ratio: floa
 _EMBEDDING_CACHE: dict = {}
 
 
+def _edge_relation(G: nx.Graph, u: str, v: str) -> str:
+    raw = G[u][v]
+    data = next(iter(raw.values()), {}) if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)) else raw
+    return str(data.get("relation") or "")
+
+
+def _unique_nodes(nodes: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for node in nodes:
+        if node not in seen:
+            seen.add(node)
+            unique.append(node)
+    return unique
+
+
+def _looks_callable_node(G: nx.Graph, nid: str) -> bool:
+    label = str(G.nodes[nid].get("label") or "")
+    return label.startswith((".", "-", "+")) or label.endswith("()")
+
+
+def _parent_seed_for_node(G: nx.Graph, nid: str) -> str | None:
+    if nid not in G:
+        return None
+    if G.is_directed():
+        for parent in G.predecessors(nid):
+            relation = _edge_relation(G, parent, nid)
+            if relation == "method" or (relation == "contains" and _looks_callable_node(G, nid)):
+                return parent
+        return None
+    if not _looks_callable_node(G, nid):
+        return None
+    for parent in G.neighbors(nid):
+        relation = _edge_relation(G, parent, nid)
+        if relation in {"method", "contains"}:
+            return parent
+    return None
+
+
+def _uplift_seed_nodes(G: nx.Graph, seeds: list[str]) -> tuple[list[str], list[str]]:
+    uplifted: list[str] = []
+    evidence: list[str] = []
+    for seed in seeds:
+        parent = _parent_seed_for_node(G, seed)
+        if parent and parent != seed:
+            uplifted.append(parent)
+            evidence.append(seed)
+        else:
+            uplifted.append(seed)
+    return _unique_nodes(uplifted), _unique_nodes(evidence)
+
+
 def _hybrid_seed_scores(G: nx.Graph, question: str, terms: list[str], top_k: int = 5) -> list[tuple[float, str]]:
     lexical = _score_nodes(G, terms)
     if not lexical:
@@ -394,21 +446,25 @@ def _query_graph_text(
     context_filters: list[str] | None = None,
 ) -> str:
     terms = [t.lower() for t in question.split() if len(t) > 2]
-    start_nodes = _pick_seeds(_hybrid_seed_scores(G, question, terms, top_k=5), max_k=5)
-    if not start_nodes:
+    raw_start_nodes = _pick_seeds(_hybrid_seed_scores(G, question, terms, top_k=5), max_k=5)
+    if not raw_start_nodes:
         return "No matching nodes found."
+    start_nodes, evidence_nodes = _uplift_seed_nodes(G, raw_start_nodes)
+    traversal_start_nodes = _unique_nodes(start_nodes + evidence_nodes)
     resolved_filters, filter_source = _resolve_context_filters(question, context_filters)
     traversal_graph = _filter_graph_by_context(G, resolved_filters)
-    nodes, edges = _dfs(traversal_graph, start_nodes, depth) if mode == "dfs" else _bfs(traversal_graph, start_nodes, depth)
+    nodes, edges = _dfs(traversal_graph, traversal_start_nodes, depth) if mode == "dfs" else _bfs(traversal_graph, traversal_start_nodes, depth)
     header_parts = [
         f"Traversal: {mode.upper()} depth={depth}",
         f"Start: {[G.nodes[n].get('label', n) for n in start_nodes]}",
     ]
+    if evidence_nodes:
+        header_parts.append(f"Evidence: {[G.nodes[n].get('label', n) for n in evidence_nodes]}")
     if resolved_filters:
         header_parts.append(f"Context: {', '.join(resolved_filters)} ({filter_source})")
     header_parts.append(f"{len(nodes)} nodes found")
     header = " | ".join(header_parts) + "\n\n"
-    return header + _subgraph_to_text(traversal_graph, nodes, edges, token_budget, seeds=start_nodes)
+    return header + _subgraph_to_text(traversal_graph, nodes, edges, token_budget, seeds=traversal_start_nodes)
 
 
 def _find_node(G: nx.Graph, label: str) -> list[str]:

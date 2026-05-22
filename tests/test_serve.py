@@ -198,6 +198,95 @@ def test_query_graph_text_caps_broad_depth_expansion():
     assert "65 nodes found" in text
 
 
+def test_query_uplifts_method_seed_to_parent_class():
+    G = nx.DiGraph()
+    G.add_node("controller", label="PopoSessionTranspondMessageHandler", source_file="handler.mm", community=0)
+    G.add_node("forward", label=".messageForwardSourceUserId()", source_file="handler.mm", community=0)
+    G.add_node("other", label=".beginTranspond()", source_file="handler.mm", community=0)
+    G.add_edge("controller", "forward", relation="method", confidence="EXTRACTED")
+    G.add_edge("controller", "other", relation="method", confidence="EXTRACTED")
+
+    text = _query_graph_text(G, "messageForwardSourceUserId", mode="bfs", depth=1, token_budget=2000)
+
+    assert "Start: ['PopoSessionTranspondMessageHandler']" in text
+    assert "Evidence: ['.messageForwardSourceUserId()']" in text
+    assert "NODE PopoSessionTranspondMessageHandler" in text
+    assert "NODE .messageForwardSourceUserId()" in text
+    assert "NODE .beginTranspond()" in text
+
+
+def test_query_keeps_method_evidence_for_call_context_after_uplift():
+    G = nx.DiGraph()
+    G.add_node("controller", label="PopoSessionTranspondMessageHandler", source_file="handler.mm", community=0)
+    G.add_node("forward", label=".forwardEntry()", source_file="handler.mm", community=0)
+    G.add_node("sender", label="PopoNewSendMessageManager", source_file="send.mm", community=1)
+    G.add_edge("controller", "forward", relation="method", confidence="EXTRACTED")
+    G.add_edge("forward", "sender", relation="calls", confidence="EXTRACTED", context="call")
+
+    text = _query_graph_text(
+        G,
+        "who calls forwardEntry",
+        mode="bfs",
+        depth=1,
+        token_budget=2000,
+        context_filters=["call"],
+    )
+
+    assert "Start: ['PopoSessionTranspondMessageHandler']" in text
+    assert "Evidence: ['.forwardEntry()']" in text
+    assert "Context: call (explicit)" in text
+    assert "PopoNewSendMessageManager" in text
+
+
+def test_query_leaves_standalone_method_seed_when_no_parent():
+    G = nx.DiGraph()
+    G.add_node("standalone", label=".standaloneForward()", source_file="handler.mm", community=0)
+
+    text = _query_graph_text(G, "standaloneForward", mode="bfs", depth=1, token_budget=2000)
+
+    assert "Start: ['.standaloneForward()']" in text
+    assert "Evidence:" not in text
+
+
+def test_query_does_not_uplift_class_seed_to_file_container():
+    G = nx.DiGraph()
+    G.add_node("file", label="handler.mm", source_file="handler.mm", community=0)
+    G.add_node("controller", label="PopoSessionTranspondMessageHandler", source_file="handler.mm", community=0)
+    G.add_edge("file", "controller", relation="contains", confidence="EXTRACTED")
+
+    text = _query_graph_text(G, "PopoSessionTranspondMessageHandler", mode="bfs", depth=1, token_budget=2000)
+
+    assert "Start: ['PopoSessionTranspondMessageHandler']" in text
+    assert "Evidence:" not in text
+
+
+def test_query_deduplicates_multiple_method_hits_to_same_parent_class():
+    G = nx.DiGraph()
+    G.add_node("controller", label="PopoSessionTranspondMessageHandler", source_file="handler.mm", community=0)
+    G.add_node("forward1", label=".forwardEntry()", source_file="handler.mm", community=0)
+    G.add_node("forward2", label=".forwardConfirm()", source_file="handler.mm", community=0)
+    G.add_edge("controller", "forward1", relation="method", confidence="EXTRACTED")
+    G.add_edge("controller", "forward2", relation="method", confidence="EXTRACTED")
+
+    text = _query_graph_text(G, "forward", mode="bfs", depth=1, token_budget=2000)
+
+    assert "Start: ['PopoSessionTranspondMessageHandler']" in text
+    assert "Start: ['PopoSessionTranspondMessageHandler', 'PopoSessionTranspondMessageHandler']" not in text
+    assert "Evidence: ['.forwardConfirm()', '.forwardEntry()']" in text
+
+
+def test_query_does_not_reverse_uplift_class_seed_in_undirected_graph():
+    G = nx.Graph()
+    G.add_node("controller", label="PopoSessionTranspondMessageHandler", source_file="handler.mm", community=0)
+    G.add_node("forward", label="-messageForwardSourceUserId", source_file="handler.mm", community=0)
+    G.add_edge("controller", "forward", relation="method", confidence="EXTRACTED")
+
+    text = _query_graph_text(G, "PopoSessionTranspondMessageHandler", mode="bfs", depth=1, token_budget=2000)
+
+    assert "Start: ['PopoSessionTranspondMessageHandler']" in text
+    assert "Evidence:" not in text
+
+
 # --- _load_graph ---
 
 def test_load_graph_roundtrip(tmp_path):
